@@ -8,7 +8,7 @@
 - [x] test-03 <!-- test-03 -->
 - [ ] test-04 <!-- test-04 -->
 - [ ] test-05 <!-- test-05 -->
-- [ ] test-06 <!-- test-06 -->
+- [x] test-06 <!-- test-06 -->
 - [ ] test-07 <!-- test-07 -->
 - [x] test-08 <!-- test-08 -->
 - [ ] test-09 <!-- test-09 -->
