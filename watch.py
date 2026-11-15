@@ -159,7 +159,8 @@ def fetch_html(url):
     response.raise_for_status()
 
     if response.encoding is None:
-        response.encoding = response.apparent_encoding
+        response.encoding = "utf-8"
+
 
     return response.text
 
