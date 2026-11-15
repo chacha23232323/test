@@ -163,7 +163,7 @@ def fetch_html(url):
 
 
 def detect_daily_statuses(html, year, month):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     results = {}
 
     for cell in soup.select("td.empty, td.a_little"):
