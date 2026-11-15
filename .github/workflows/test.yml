@@ -27,7 +27,11 @@ jobs:
         run: |
           printf '%s' "$TARGETS_JSON" > targets.json
 
-      - run: pip install -r requirements.txt
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv pip install --system -r requirements.txt
 
       - name: Check availability and notify
         env:
