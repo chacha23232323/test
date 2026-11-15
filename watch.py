@@ -163,9 +163,6 @@ def fetch_html(url):
     return response.text
 
 
-
-
-
 def detect_daily_statuses(html, year, month):
     soup = BeautifulSoup(html, "lxml")
     results = {}
@@ -205,7 +202,7 @@ def load_state():
     except json.JSONDecodeError:
         raise RuntimeError(
             "state.json が壊れています。安全のため停止します"
-        )
+        ) from None
 
 
 def save_state(state):
@@ -215,7 +212,6 @@ def save_state(state):
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-
     os.replace(temp_path, STATE_PATH)
 
 
@@ -410,12 +406,12 @@ def build_notice_blocks(
 
             current_lines = [daily_line]
 
-            if len(
-                "\n".join(header + current_lines + tail)
-            ) > max_block_chars:
-                raise RuntimeError(
-                    f"{group_key[1]} の日付情報とURLが長すぎます"
-                )
+        if len(
+            "\n".join(header + current_lines + tail)
+        ) > max_block_chars:
+            raise RuntimeError(
+                f"{group_key[1]} の日付情報とURLが長すぎます"
+            )
 
         if current_lines:
             blocks.append({
@@ -499,33 +495,35 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(target, today, previous_months, is_baseline):
+def scan_month(
+    target,
+    today,
+    year,
+    month,
+    previous_months,
+    is_baseline,
+):
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
     nights = target["nights"]
     base_date = date.fromisoformat(target["date"])
 
-    current_months = {}
-    newly_available_entries = []
+    month_key = f"{year:04d}-{month:02d}"
+    url = make_month_url(
+        target["url"],
+        year,
+        month,
+        base_date,
+    )
 
-    for year, month in target_months(today):
-        month_key = f"{year:04d}-{month:02d}"
-        url = make_month_url(
-            target["url"],
-            year,
-            month,
-            base_date,
-        )
+    html = fetch_html(url)
+    current = detect_daily_statuses(html, year, month)
 
-        html = fetch_html(url)
-        current = detect_daily_statuses(html, year, month)
-        current_months[month_key] = current
-        previous = previous_months.get(month_key, {})
+    entries = []
+    previous = previous_months.get(month_key, {})
 
-        if is_baseline or month_key not in previous_months:
-            continue
-
+    if not is_baseline and month_key in previous_months:
         newly_available = {
             day: status
             for day, status in current.items()
@@ -533,7 +531,7 @@ def scan_target(target, today, previous_months, is_baseline):
         }
 
         for day, status in newly_available.items():
-            newly_available_entries.append({
+            entries.append({
                 "target_id": target_id,
                 "name": name,
                 "location": location,
@@ -547,8 +545,9 @@ def scan_target(target, today, previous_months, is_baseline):
 
     return {
         "target_id": target_id,
-        "months": current_months,
-        "entries": newly_available_entries,
+        "month_key": month_key,
+        "current": current,
+        "entries": entries,
         "is_baseline": is_baseline,
     }
 
@@ -609,6 +608,8 @@ def main():
         return
 
     jobs = {}
+    month_results = {}
+    failed_target_ids = set()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for target in scan_targets:
@@ -622,33 +623,60 @@ def main():
 
             previous_months = old_entry.get("months", {})
 
-            future = executor.submit(
-                scan_target,
-                target,
-                today,
-                previous_months,
-                is_baseline,
-            )
+            for year, month in target_months(today):
+                future = executor.submit(
+                    scan_month,
+                    target,
+                    today,
+                    year,
+                    month,
+                    previous_months,
+                    is_baseline,
+                )
 
-            jobs[future] = target_id
+                jobs[future] = (target_id, f"{year:04d}-{month:02d}")
 
         for future in as_completed(jobs):
-            target_id = jobs[future]
+            target_id, month_key = jobs[future]
 
             try:
                 result = future.result()
-                successful_results.append(result)
 
-                if result["is_baseline"]:
-                    baseline_count += 1
+                month_results.setdefault(target_id, {})[month_key] = result
 
             except Exception as error:
-                failures.append(target_id)
+                failed_target_ids.add(target_id)
 
                 print(
-                    f"ERROR target={target_id}: "
+                    f"ERROR target={target_id} month={month_key}: "
                     f"{type(error).__name__}"
                 )
+
+    for target_id, month_map in month_results.items():
+        entries = []
+
+        for month_key, result in month_map.items():
+            entries.extend(result["entries"])
+
+        is_baseline = any(
+            result["is_baseline"]
+            for result in month_map.values()
+        )
+
+        if is_baseline:
+            baseline_count += 1
+
+        successful_results.append({
+            "target_id": target_id,
+            "months": {
+                month_key: result["current"]
+                for month_key, result in month_map.items()
+            },
+            "entries": entries,
+            "is_baseline": is_baseline,
+        })
+
+    failures = sorted(failed_target_ids)
 
     all_notices = []
     pending_tags = set()
@@ -866,7 +894,7 @@ def main():
     ).total_seconds()
 
     print(f"\n処理時間: {elapsed:.1f}秒")
-    print(f"同時アクセス上限: {MAX_WORKERS}施設")
+    print(f"同時アクセス上限: {MAX_WORKERS}件")
 
     if failures:
         print("失敗した施設:", ", ".join(failures))
@@ -880,4 +908,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
