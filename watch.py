@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 STATE_PATH = Path("state.json")
 JST = ZoneInfo("Asia/Tokyo")
 
-MAX_WORKERS = 40
+MAX_WORKERS = 12
 REQUEST_TIMEOUT = (5, 25)
 
 MAX_EMBEDS_PER_MESSAGE = 10
