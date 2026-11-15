@@ -157,9 +157,12 @@ def fetch_html(url):
         timeout=REQUEST_TIMEOUT
     )
     response.raise_for_status()
-    response.encoding = response.apparent_encoding
+
+    if response.encoding is None:
+        response.encoding = "utf-8"
 
     return response.text
+
 
 
 def detect_daily_statuses(html, year, month):
