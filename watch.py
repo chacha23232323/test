@@ -809,3 +809,124 @@ def main():
                         f"🔗 [施設申し込みを開く]({COMMON_CALENDAR_URL})"
                     ),
                     "tags": set(pending_tags),
+                    "embed_title": "🔗 施設申し込み",
+                    "color": COLOR_COMMON,
+                })
+
+            messages = pack_notice_messages(all_blocks)
+
+            tag_message_indexes = {}
+
+            for index, message in enumerate(messages):
+                for tag in message["tags"]:
+                    tag_message_indexes.setdefault(
+                        tag,
+                        set()
+                    ).add(index)
+
+            delivered_indexes = set()
+            committed_tags = set()
+
+            total_batches = len(messages)
+
+            print("\n通知メッセージ数:", len(messages))
+            print(
+                "Embed数:",
+                sum(
+                    len(message["embeds"])
+                    for message in messages
+                )
+            )
+
+            for batch_number, start in enumerate(
+                range(0, len(messages), 1),
+                start=1,
+            ):
+                batch = messages[start:start + 1]
+
+                print(
+                    f"Discord送信: "
+                    f"{batch_number}/{total_batches} "
+                    f"（{len(batch)}メッセージ）"
+                )
+
+                discord_webhook(batch)
+
+                delivered_indexes.update(
+                    range(start, start + len(batch))
+                )
+
+                for tag, indexes in tag_message_indexes.items():
+                    if tag in committed_tags:
+                        continue
+
+                    if indexes.issubset(delivered_indexes):
+                        target_id, month_key = tag
+
+                        state.setdefault(
+                            target_id,
+                            {"months": {}}
+                        )
+
+                        state[target_id].setdefault(
+                            "months", {}
+                        )[month_key] = tag_current_data[tag]
+
+                        committed_tags.add(tag)
+
+                if is_release_day:
+                    for target_id, tags in target_tags.items():
+                        if tags.issubset(committed_tags):
+                            release_done.add(target_id)
+
+                    meta["release_done_targets"] = sorted(
+                        release_done
+                    )
+
+                save_state(state)
+
+            print(
+                f"\n通知送信成功: "
+                f"{len(all_notices)}件"
+            )
+
+        except Exception as error:
+            notification_error = error
+
+            print(
+                "\nDiscord通知エラー:",
+                f"{type(error).__name__}"
+            )
+
+    else:
+        print("\n新しい空室はありません。")
+
+    if is_release_day:
+        meta["release_done_targets"] = sorted(release_done)
+        save_state(state)
+
+    if baseline_count:
+        print(
+            f"\n通知なしで基準を作成した施設数: "
+            f"{baseline_count}"
+        )
+
+    elapsed = (
+        datetime.now(JST) - started_at
+    ).total_seconds()
+
+    print(f"\n処理時間: {elapsed:.1f}秒")
+    print(f"同時アクセス上限: {MAX_WORKERS}施設")
+
+    if failures:
+        print("失敗した施設:", ", ".join(failures))
+
+    if notification_error:
+        print("通知の一部または全部が未完了です。")
+
+    if failures or notification_error:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
