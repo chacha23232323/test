@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 
+
 STATE_PATH = Path("state.json")
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -22,6 +23,8 @@ REQUEST_TIMEOUT = (5, 25)
 
 MAX_EMBEDS_PER_MESSAGE = 10
 MAX_EMBED_TOTAL_CHARS = 5800
+MAX_EMBED_TITLE_CHARS = 256
+
 DISCORD_MAX_RETRIES = 5
 
 COLOR_HIGHLIGHTED = 0xE74C3C
@@ -47,8 +50,11 @@ def get_session():
 
 def load_targets():
     data = json.loads(
-        Path("targets.json").read_text(encoding="utf-8")
+        Path("targets.json").read_text(
+            encoding="utf-8"
+        )
     )
+
     targets = data.get("targets", [])
 
     if not targets:
@@ -74,7 +80,11 @@ def load_highlighted_ids(targets):
     except FileNotFoundError:
         raise RuntimeError("highlight.md がありません") from None
 
-    target_ids = [str(target["id"]) for target in targets]
+    target_ids = [
+        str(target["id"])
+        for target in targets
+    ]
+
     valid_ids = set(target_ids)
 
     if len(valid_ids) != len(target_ids):
@@ -157,7 +167,6 @@ def fetch_html(url):
         timeout=REQUEST_TIMEOUT
     )
     response.raise_for_status()
-
     response.encoding = "utf-8"
 
     return response.text
@@ -207,7 +216,6 @@ def load_state():
 
 def save_state(state):
     temp_path = STATE_PATH.with_suffix(".tmp")
-
     temp_path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -275,7 +283,9 @@ def discord_webhook(messages):
                     except (ValueError, TypeError):
                         retry_after = 1.0
 
-                time.sleep(max(0.0, min(retry_after, 60.0)))
+                time.sleep(
+                    max(0.0, min(retry_after, 60))
+                )
                 continue
 
             if not 200 <= response.status_code < 300:
@@ -297,13 +307,62 @@ def format_japanese_date(day_text):
     )
 
 
+def format_short_japanese_date(day_text):
+    day = date.fromisoformat(day_text)
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+
+    return (
+        f"{day.month}/{day.day}"
+        f"({weekdays[day.weekday()]})"
+    )
+
+
+def build_date_title(entries):
+    sorted_entries = sorted(
+        entries,
+        key=lambda x: x["day"],
+    )
+
+    date_texts = [
+        format_short_japanese_date(entry["day"])
+        for entry in sorted_entries
+    ]
+
+    separator = "・"
+    title = separator.join(date_texts)
+
+    if len(title) <= MAX_EMBED_TITLE_CHARS:
+        return title
+
+    visible_texts = []
+
+    for date_text in date_texts:
+        candidate = separator.join(
+            visible_texts + [date_text]
+        )
+
+        if len(candidate) > MAX_EMBED_TITLE_CHARS - 20:
+            break
+
+        visible_texts.append(date_text)
+
+    hidden_count = len(date_texts) - len(visible_texts)
+
+    if hidden_count <= 0:
+        return title
+
+    return (
+        separator.join(visible_texts)
+        + f"… ほか{hidden_count}日"
+    )
+
+
 def build_notice_blocks(
     entries,
     include_facility_urls,
     common_url=None,
     max_block_chars=3800,
 ):
-
     grouped = {}
 
     for entry in entries:
@@ -373,6 +432,8 @@ def build_notice_blocks(
                 f'> **{entry["status"]}｜{entry["nights"]}泊**'
             )
 
+        date_title = build_date_title(group["entries"])
+
         tail = []
 
         if include_facility_urls:
@@ -402,6 +463,7 @@ def build_notice_blocks(
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
+                "embed_title": date_title,
             })
 
             current_lines = [daily_line]
@@ -417,6 +479,7 @@ def build_notice_blocks(
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
+                "embed_title": date_title,
             })
 
     if common_url and all_tags:
@@ -433,13 +496,13 @@ def build_notice_blocks(
         blocks.append({
             "text": footer,
             "tags": set(all_tags),
+            "embed_title": "🔗 施設申し込み",
         })
 
     return blocks
 
 
 def pack_notice_messages(blocks):
-
     messages = []
     current_embeds = []
     current_tags = set()
@@ -449,7 +512,7 @@ def pack_notice_messages(blocks):
         title = block["embed_title"]
         description = block["text"]
 
-        if len(title) > 256:
+        if len(title) > MAX_EMBED_TITLE_CHARS:
             raise RuntimeError(
                 "Embedタイトルが長すぎます"
             )
@@ -507,6 +570,7 @@ def scan_target(target, today, previous_months, is_baseline):
 
     for year, month in target_months(today):
         month_key = f"{year:04d}-{month:02d}"
+
         url = make_month_url(
             target["url"],
             year,
@@ -516,7 +580,9 @@ def scan_target(target, today, previous_months, is_baseline):
 
         html = fetch_html(url)
         current = detect_daily_statuses(html, year, month)
+
         current_months[month_key] = current
+
         previous = previous_months.get(month_key, {})
 
         if is_baseline or month_key not in previous_months:
@@ -587,7 +653,6 @@ def main():
             meta["release_done_targets"] = list(release_done)
 
         print("\n【27日 受付開始通知モード】")
-
     else:
         release_done = set()
 
@@ -637,7 +702,6 @@ def main():
 
                 if result["is_baseline"]:
                     baseline_count += 1
-
             except Exception as error:
                 failures.append(target_id)
 
@@ -692,13 +756,6 @@ def main():
 
     if all_notices:
         try:
-            if is_release_day:
-                standard_title = "🆕 通常施設"
-                highlighted_title = "🚨 注目施設"
-            else:
-                standard_title = "🆕 通常施設"
-                highlighted_title = "🚨 注目施設"
-
             highlighted_notices = [
                 entry for entry in all_notices
                 if entry["target_id"] in highlighted_ids
@@ -712,19 +769,17 @@ def main():
             notice_groups = [
                 (
                     highlighted_notices,
-                    highlighted_title,
                     COLOR_HIGHLIGHTED,
                 ),
                 (
                     standard_notices,
-                    standard_title,
                     COLOR_STANDARD,
                 ),
             ]
 
             all_blocks = []
 
-            for notice_group, title, color in notice_groups:
+            for notice_group, color in notice_groups:
                 if not notice_group:
                     continue
 
@@ -736,7 +791,6 @@ def main():
                 )
 
                 for block in blocks:
-                    block["embed_title"] = title
                     block["color"] = color
 
                 all_blocks.extend(blocks)
@@ -755,124 +809,3 @@ def main():
                         f"🔗 [施設申し込みを開く]({COMMON_CALENDAR_URL})"
                     ),
                     "tags": set(pending_tags),
-                    "embed_title": "🔗 施設申し込み",
-                    "color": COLOR_COMMON,
-                })
-
-            messages = pack_notice_messages(all_blocks)
-
-            tag_message_indexes = {}
-
-            for index, message in enumerate(messages):
-                for tag in message["tags"]:
-                    tag_message_indexes.setdefault(
-                        tag,
-                        set()
-                    ).add(index)
-
-            delivered_indexes = set()
-            committed_tags = set()
-
-            total_batches = len(messages)
-
-            print("\n通知メッセージ数:", len(messages))
-            print(
-                "Embed数:",
-                sum(
-                    len(message["embeds"])
-                    for message in messages
-                )
-            )
-
-            for batch_number, start in enumerate(
-                range(0, len(messages), 1),
-                start=1,
-            ):
-                batch = messages[start:start + 1]
-
-                print(
-                    f"Discord送信: "
-                    f"{batch_number}/{total_batches} "
-                    f"（{len(batch)}メッセージ）"
-                )
-
-                discord_webhook(batch)
-
-                delivered_indexes.update(
-                    range(start, start + len(batch))
-                )
-
-                for tag, indexes in tag_message_indexes.items():
-                    if tag in committed_tags:
-                        continue
-
-                    if indexes.issubset(delivered_indexes):
-                        target_id, month_key = tag
-
-                        state.setdefault(
-                            target_id,
-                            {"months": {}}
-                        )
-
-                        state[target_id].setdefault(
-                            "months", {}
-                        )[month_key] = tag_current_data[tag]
-
-                        committed_tags.add(tag)
-
-                if is_release_day:
-                    for target_id, tags in target_tags.items():
-                        if tags.issubset(committed_tags):
-                            release_done.add(target_id)
-
-                    meta["release_done_targets"] = sorted(
-                        release_done
-                    )
-
-                save_state(state)
-
-            print(
-                f"\n通知送信成功: "
-                f"{len(all_notices)}件"
-            )
-
-        except Exception as error:
-            notification_error = error
-
-            print(
-                "\nDiscord通知エラー:",
-                f"{type(error).__name__}"
-            )
-
-    else:
-        print("\n新しい空室はありません。")
-
-    if is_release_day:
-        meta["release_done_targets"] = sorted(release_done)
-        save_state(state)
-
-    if baseline_count:
-        print(
-            f"\n通知なしで基準を作成した施設数: "
-            f"{baseline_count}"
-        )
-
-    elapsed = (
-        datetime.now(JST) - started_at
-    ).total_seconds()
-
-    print(f"\n処理時間: {elapsed:.1f}秒")
-    print(f"同時アクセス上限: {MAX_WORKERS}施設")
-
-    if failures:
-        print("失敗した施設:", ", ".join(failures))
-
-    if notification_error:
-        print("通知の一部または全部が未完了です。")
-
-    if failures or notification_error:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
