@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -692,12 +693,8 @@ def main():
 
     if all_notices:
         try:
-            if is_release_day:
-                standard_title = "🆕 通常施設"
-                highlighted_title = "🚨 注目施設"
-            else:
-                standard_title = "🆕 通常施設"
-                highlighted_title = "🚨 注目施設"
+            standard_title = "🆕"
+            highlighted_title = "🚨"
 
             highlighted_notices = [
                 entry for entry in all_notices
@@ -736,7 +733,14 @@ def main():
                 )
 
                 for block in blocks:
-                    block["embed_title"] = title
+                    facility_name = (
+                        block["text"]
+                        .splitlines()[0]
+                        .replace("🏨 **", "", 1)
+                        .replace("**", "")
+                    )
+
+                    block["embed_title"] = f"{title} {facility_name}"
                     block["color"] = color
 
                 all_blocks.extend(blocks)
