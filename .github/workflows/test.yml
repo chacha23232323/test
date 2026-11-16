@@ -16,15 +16,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
+    env:
+      UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
+
+      # uv本体をキャッシュ
+      - name: Cache uv binary
+        id: uv-binary-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/uv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-0.13.8
+
+      # キャッシュがなければuvをインストール
+      - name: Install uv
+        if: steps.uv-binary-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -LsSf https://astral.sh/uv/0.13.8/install.sh | sh
+
+      - name: Add uv to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Pythonパッケージのキャッシュ
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/uv-cache
+          key: uv-packages-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            uv-packages-${{ runner.os }}-${{ runner.arch }}-py312-
 
       - name: Create targets.json
         env:
@@ -33,7 +59,7 @@ jobs:
           printf '%s' "$TARGETS_JSON" > targets.json
 
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
+        run: uv pip install --system -r requirements.txt
 
       - name: Check availability and notify
         env:
