@@ -81,17 +81,14 @@ def parse_highlight_weekdays(label, line_number):
         label,
     )
 
-    # 曜日指定がなければ全曜日
     if not day_match:
         return None
 
     day_text = day_match.group(1).strip()
 
-    # 全曜日指定
     if day_text == "全曜日":
         return None
 
-    # 区切り文字を除去
     normalized = re.sub(
         r"[・、,，\s]+",
         "",
@@ -148,8 +145,6 @@ def load_highlighted_ids(targets):
     )
 
     seen_ids = set()
-
-    # {施設ID: None または 曜日set}
     highlighted_ids = {}
 
     for line_number, line in enumerate(lines, start=1):
@@ -195,17 +190,14 @@ def load_highlighted_ids(targets):
 def is_highlighted_entry(entry, highlighted_ids):
     target_id = str(entry["target_id"])
 
-    # チェックされていない施設は通常通知
     if target_id not in highlighted_ids:
         return False
 
     weekdays = highlighted_ids[target_id]
 
-    # None は全曜日対象
     if weekdays is None:
         return True
 
-    # 空室日の日付から曜日を判定
     entry_weekday = date.fromisoformat(
         entry["day"]
     ).weekday()
@@ -438,8 +430,8 @@ def build_notice_blocks(
         year = group_key[2]
         month = group_key[3]
 
+        # 施設名はEmbedタイトルに表示するため、本文から削除
         header = [
-            f'🏨 **{group_key[1]}**',
             f'📍 {group["location"]}',
             f'📅 {year}年{month}月',
         ]
@@ -787,7 +779,6 @@ def main():
             standard_title = "🆕"
             highlighted_title = "🚨"
 
-            # 曜日条件に一致する空室だけを注目通知にする
             highlighted_notices = [
                 entry
                 for entry in all_notices
@@ -797,7 +788,6 @@ def main():
                 )
             ]
 
-            # 注目通知に該当しない空室は通常通知にする
             standard_notices = [
                 entry
                 for entry in all_notices
@@ -834,14 +824,37 @@ def main():
                 )
 
                 for block in blocks:
-                    facility_name = (
-                        block["text"]
-                        .splitlines()[0]
-                        .replace("🏨 **", "", 1)
-                        .replace("**", "")
+                    # 本文の先頭行は所在地になったため、
+                    # 施設名はentriesから取得する
+                    first_entry = next(
+                        entry
+                        for entry in notice_group
+                        if (
+                            str(entry["target_id"]),
+                            entry["name"],
+                            date.fromisoformat(entry["day"]).year,
+                            date.fromisoformat(entry["day"]).month,
+                        ) == next(
+                            (
+                                key for key in [
+                                    (
+                                        str(e["target_id"]),
+                                        e["name"],
+                                        date.fromisoformat(e["day"]).year,
+                                        date.fromisoformat(e["day"]).month,
+                                    )
+                                    for e in notice_group
+                                ]
+                                if key[0] in block["tags"] and
+                                f'{key[2]}年{key[3]}月' in block["text"]
+                            ),
+                            None,
+                        )
                     )
 
-                    block["embed_title"] = f"{title} {facility_name}"
+                    block["embed_title"] = (
+                        f'{title} {first_entry["name"]}'
+                    )
                     block["color"] = color
 
                 all_blocks.extend(blocks)
