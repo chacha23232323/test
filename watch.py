@@ -67,6 +67,66 @@ def load_targets():
     return targets
 
 
+def parse_highlight_weekdays(label, line_number):
+    """
+    施設名末尾の曜日指定を解析する。
+
+    戻り値:
+      None       : 全曜日
+      set[int]   : 指定曜日のみ（月=0 ... 日=6）
+    """
+
+    day_match = re.search(
+        r"[（(]([^（）()]*)[）)]\s*$",
+        label,
+    )
+
+    # 曜日指定がなければ全曜日
+    if not day_match:
+        return None
+
+    day_text = day_match.group(1).strip()
+
+    # 全曜日指定
+    if day_text == "全曜日":
+        return None
+
+    # 区切り文字を除去
+    normalized = re.sub(
+        r"[・、,，\s]+",
+        "",
+        day_text,
+    )
+
+    weekday_map = {
+        "月": 0,
+        "火": 1,
+        "水": 2,
+        "木": 3,
+        "金": 4,
+        "土": 5,
+        "日": 6,
+    }
+
+    if not normalized:
+        raise RuntimeError(
+            f"highlight.md {line_number}行目の曜日指定が空です"
+        )
+
+    weekdays = set()
+
+    for character in normalized:
+        if character not in weekday_map:
+            raise RuntimeError(
+                f"highlight.md {line_number}行目の曜日指定が正しくありません: "
+                f"{day_text}"
+            )
+
+        weekdays.add(weekday_map[character])
+
+    return weekdays
+
+
 def load_highlighted_ids(targets):
     try:
         lines = Path("highlight.md").read_text(
@@ -82,12 +142,15 @@ def load_highlighted_ids(targets):
         raise RuntimeError("targets.json の施設IDが重複しています")
 
     checkbox_pattern = re.compile(
-        r"^\s*-\s+\[(?P<checked>[ xX])\]\s+.*?"
+        r"^\s*-\s+\[(?P<checked>[ xX])\]\s+"
+        r"(?P<label>.*?)\s*"
         r"<!--\s*(?P<id>[A-Za-z0-9_-]+)\s*-->\s*$"
     )
 
     seen_ids = set()
-    highlighted_ids = set()
+
+    # {施設ID: None または 曜日set}
+    highlighted_ids = {}
 
     for line_number, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -117,9 +180,37 @@ def load_highlighted_ids(targets):
                     f"highlight.md の注目施設IDがtargets.jsonにありません: {target_id}"
                 )
 
-            highlighted_ids.add(target_id)
+            label = match.group("label").strip()
+
+            weekdays = parse_highlight_weekdays(
+                label,
+                line_number,
+            )
+
+            highlighted_ids[target_id] = weekdays
 
     return highlighted_ids
+
+
+def is_highlighted_entry(entry, highlighted_ids):
+    target_id = str(entry["target_id"])
+
+    # チェックされていない施設は通常通知
+    if target_id not in highlighted_ids:
+        return False
+
+    weekdays = highlighted_ids[target_id]
+
+    # None は全曜日対象
+    if weekdays is None:
+        return True
+
+    # 空室日の日付から曜日を判定
+    entry_weekday = date.fromisoformat(
+        entry["day"]
+    ).weekday()
+
+    return entry_weekday in weekdays
 
 
 def make_month_url(original_url, year, month, base_date):
@@ -696,14 +787,24 @@ def main():
             standard_title = "🆕"
             highlighted_title = "🚨"
 
+            # 曜日条件に一致する空室だけを注目通知にする
             highlighted_notices = [
-                entry for entry in all_notices
-                if entry["target_id"] in highlighted_ids
+                entry
+                for entry in all_notices
+                if is_highlighted_entry(
+                    entry,
+                    highlighted_ids,
+                )
             ]
 
+            # 注目通知に該当しない空室は通常通知にする
             standard_notices = [
-                entry for entry in all_notices
-                if entry["target_id"] not in highlighted_ids
+                entry
+                for entry in all_notices
+                if not is_highlighted_entry(
+                    entry,
+                    highlighted_ids,
+                )
             ]
 
             notice_groups = [
