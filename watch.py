@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -14,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
-from bs4 import BeautifulSoup
+from lxml import html as lxml_html
 
 STATE_PATH = Path("state.json")
 JST = ZoneInfo("Asia/Tokyo")
@@ -43,9 +42,6 @@ _metrics = {
 }
 
 DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
-STATUS_CELL_PATTERN = re.compile(
-    r"(?:^|\s)(?:empty|a_little)(?:\s|$)"
-)
 
 WEEKDAY_MAP = {
     "月": 0,
@@ -297,14 +293,25 @@ def detect_daily_statuses(html, year, month):
     started = time.monotonic()
 
     try:
-        soup = BeautifulSoup(html, "lxml")
+        if not html or not html.strip():
+            return {}
+
+        document = lxml_html.fromstring(html)
+
+        cells = document.xpath(
+            "//td[contains(concat(' ', normalize-space(@class), ' '), ' empty ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' a_little ')]"
+        )
+
         results = {}
 
-        for cell in soup.find_all(
-            "td",
-            class_=STATUS_CELL_PATTERN,
-        ):
-            value = cell.get_text(" ", strip=True)
+        for cell in cells:
+            value = " ".join(
+                part.strip()
+                for part in cell.itertext()
+                if part.strip()
+            )
+
             match = DAY_PATTERN.match(value)
 
             if not match:
@@ -317,7 +324,7 @@ def detect_daily_statuses(html, year, month):
             except ValueError:
                 continue
 
-            classes = cell.get("class", [])
+            classes = (cell.get("class") or "").split()
 
             if "a_little" in classes:
                 results[calendar_date.isoformat()] = "△"
