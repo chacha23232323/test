@@ -332,8 +332,8 @@ def discord_webhook(messages):
             except requests.RequestException as error:
                 raise RuntimeError(
                     f"Discord送信中に通信エラーが発生しました "
-                    f"({type(error).__name__})"
-                ) from None
+                    f"({type(error).__name__}: {error})"
+                ) from error
 
             if response.status_code == 429:
                 if attempt >= DISCORD_MAX_RETRIES:
@@ -365,7 +365,8 @@ def discord_webhook(messages):
             if not 200 <= response.status_code < 300:
                 raise RuntimeError(
                     f"Discord送信に失敗しました "
-                    f"(HTTP {response.status_code})"
+                    f"(HTTP {response.status_code}: "
+                    f"{response.text[:500]})"
                 )
 
             break
@@ -387,7 +388,6 @@ def build_notice_blocks(
     common_url=None,
     max_block_chars=3800,
 ):
-
     grouped = {}
 
     for entry in entries:
@@ -406,6 +406,7 @@ def build_notice_blocks(
         if group_key not in grouped:
             grouped[group_key] = {
                 "target_id": target_id,
+                "facility_name": entry["name"],
                 "month_key": month_key,
                 "location": entry["location"],
                 "url": entry["url"],
@@ -430,7 +431,6 @@ def build_notice_blocks(
         year = group_key[2]
         month = group_key[3]
 
-        # 施設名はEmbedタイトルに表示するため、本文から削除
         header = [
             f'📍 {group["location"]}',
             f'📅 {year}年{month}月',
@@ -486,6 +486,7 @@ def build_notice_blocks(
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
+                "facility_name": group["facility_name"],
             })
 
             current_lines = [daily_line]
@@ -501,6 +502,7 @@ def build_notice_blocks(
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
+                "facility_name": group["facility_name"],
             })
 
     if common_url and all_tags:
@@ -517,13 +519,13 @@ def build_notice_blocks(
         blocks.append({
             "text": footer,
             "tags": set(all_tags),
+            "facility_name": "施設申し込み",
         })
 
     return blocks
 
 
 def pack_notice_messages(blocks):
-
     messages = []
     current_embeds = []
     current_tags = set()
@@ -727,7 +729,7 @@ def main():
 
                 print(
                     f"ERROR target={target_id}: "
-                    f"{type(error).__name__}"
+                    f"{type(error).__name__}: {error}"
                 )
 
     all_notices = []
@@ -823,37 +825,11 @@ def main():
                     max_block_chars=3800,
                 )
 
+                # 施設名はブロック生成時に保持しているため、
+                # next()による検索・照合は不要
                 for block in blocks:
-                    # 本文の先頭行は所在地になったため、
-                    # 施設名はentriesから取得する
-                    first_entry = next(
-                        entry
-                        for entry in notice_group
-                        if (
-                            str(entry["target_id"]),
-                            entry["name"],
-                            date.fromisoformat(entry["day"]).year,
-                            date.fromisoformat(entry["day"]).month,
-                        ) == next(
-                            (
-                                key for key in [
-                                    (
-                                        str(e["target_id"]),
-                                        e["name"],
-                                        date.fromisoformat(e["day"]).year,
-                                        date.fromisoformat(e["day"]).month,
-                                    )
-                                    for e in notice_group
-                                ]
-                                if key[0] in block["tags"] and
-                                f'{key[2]}年{key[3]}月' in block["text"]
-                            ),
-                            None,
-                        )
-                    )
-
                     block["embed_title"] = (
-                        f'{title} {first_entry["name"]}'
+                        f'{title} {block["facility_name"]}'
                     )
                     block["color"] = color
 
@@ -959,7 +935,7 @@ def main():
 
             print(
                 "\nDiscord通知エラー:",
-                f"{type(error).__name__}"
+                f"{type(error).__name__}: {error}"
             )
 
     else:
