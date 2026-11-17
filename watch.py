@@ -34,6 +34,13 @@ COMMON_CALENDAR_URL = os.environ.get("COMMON_CALENDAR_URL", "").strip()
 
 _thread_local = threading.local()
 _discord_session = None
+_metrics_lock = threading.Lock()
+_metrics = {
+    "requests": 0,
+    "http_seconds": 0.0,
+    "parse_seconds": 0.0,
+    "facility_times": {},
+}
 
 DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
 STATUS_CELL_PATTERN = re.compile(
@@ -56,7 +63,6 @@ WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 def get_session():
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
-
         session.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
@@ -70,7 +76,6 @@ def get_session():
 
         session.mount("http://", adapter)
         session.mount("https://", adapter)
-
         _thread_local.session = session
 
     return _thread_local.session
@@ -81,7 +86,6 @@ def get_discord_session():
 
     if _discord_session is None:
         session = requests.Session()
-
         session.headers.update({
             "User-Agent": "Mozilla/5.0",
         })
@@ -94,7 +98,6 @@ def get_discord_session():
 
         session.mount("http://", adapter)
         session.mount("https://", adapter)
-
         _discord_session = session
 
     return _discord_session
@@ -272,44 +275,61 @@ def target_months(today):
 
 
 def fetch_html(url):
-    with get_session().get(
-        url,
-        timeout=REQUEST_TIMEOUT,
-    ) as response:
-        response.raise_for_status()
-        response.encoding = "utf-8"
-        return response.text
+    started = time.monotonic()
+
+    try:
+        with get_session().get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            return response.text
+    finally:
+        elapsed = time.monotonic() - started
+
+        with _metrics_lock:
+            _metrics["requests"] += 1
+            _metrics["http_seconds"] += elapsed
 
 
 def detect_daily_statuses(html, year, month):
-    soup = BeautifulSoup(html, "lxml")
-    results = {}
+    started = time.monotonic()
 
-    for cell in soup.find_all(
-        "td",
-        class_=STATUS_CELL_PATTERN,
-    ):
-        value = cell.get_text(" ", strip=True)
-        match = DAY_PATTERN.match(value)
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        results = {}
 
-        if not match:
-            continue
+        for cell in soup.find_all(
+            "td",
+            class_=STATUS_CELL_PATTERN,
+        ):
+            value = cell.get_text(" ", strip=True)
+            match = DAY_PATTERN.match(value)
 
-        day = int(match.group(1))
+            if not match:
+                continue
 
-        try:
-            calendar_date = date(year, month, day)
-        except ValueError:
-            continue
+            day = int(match.group(1))
 
-        classes = cell.get("class", [])
+            try:
+                calendar_date = date(year, month, day)
+            except ValueError:
+                continue
 
-        if "a_little" in classes:
-            results[calendar_date.isoformat()] = "△"
-        elif "empty" in classes:
-            results[calendar_date.isoformat()] = "○"
+            classes = cell.get("class", [])
 
-    return results
+            if "a_little" in classes:
+                results[calendar_date.isoformat()] = "△"
+            elif "empty" in classes:
+                results[calendar_date.isoformat()] = "○"
+
+        return results
+    finally:
+        elapsed = time.monotonic() - started
+
+        with _metrics_lock:
+            _metrics["parse_seconds"] += elapsed
 
 
 def load_state():
@@ -638,6 +658,8 @@ def scan_target(
     previous_months,
     is_baseline,
 ):
+    target_started = time.monotonic()
+
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
@@ -647,55 +669,98 @@ def scan_target(
     current_months = {}
     newly_available_entries = []
 
-    for year, month in months_to_scan:
-        month_key = f"{year:04d}-{month:02d}"
+    try:
+        for year, month in months_to_scan:
+            month_key = f"{year:04d}-{month:02d}"
 
-        url = make_month_url(
-            target["url"],
-            year,
-            month,
-            base_date,
-        )
+            url = make_month_url(
+                target["url"],
+                year,
+                month,
+                base_date,
+            )
 
-        html = fetch_html(url)
+            html = fetch_html(url)
 
-        current = detect_daily_statuses(
-            html,
-            year,
-            month,
-        )
+            current = detect_daily_statuses(
+                html,
+                year,
+                month,
+            )
 
-        current_months[month_key] = current
-        previous = previous_months.get(month_key, {})
+            current_months[month_key] = current
+            previous = previous_months.get(month_key, {})
 
-        if is_baseline or month_key not in previous_months:
-            continue
+            if is_baseline or month_key not in previous_months:
+                continue
 
-        newly_available = {
-            day: status
-            for day, status in current.items()
-            if day not in previous
+            newly_available = {
+                day: status
+                for day, status in current.items()
+                if day not in previous
+            }
+
+            for day, status in newly_available.items():
+                newly_available_entries.append({
+                    "target_id": target_id,
+                    "name": name,
+                    "location": location,
+                    "day": day,
+                    "status": status,
+                    "nights": nights,
+                    "trip_purpose": target.get("trip_purpose", ""),
+                    "bike_trip": target.get("bike_trip", ""),
+                    "url": target.get("access_url", url),
+                })
+
+        return {
+            "target_id": target_id,
+            "months": current_months,
+            "entries": newly_available_entries,
+            "is_baseline": is_baseline,
         }
+    finally:
+        elapsed = time.monotonic() - target_started
 
-        for day, status in newly_available.items():
-            newly_available_entries.append({
-                "target_id": target_id,
+        with _metrics_lock:
+            _metrics["facility_times"][target_id] = {
                 "name": name,
-                "location": location,
-                "day": day,
-                "status": status,
-                "nights": nights,
-                "trip_purpose": target.get("trip_purpose", ""),
-                "bike_trip": target.get("bike_trip", ""),
-                "url": target.get("access_url", url),
-            })
+                "seconds": elapsed,
+            }
 
-    return {
-        "target_id": target_id,
-        "months": current_months,
-        "entries": newly_available_entries,
-        "is_baseline": is_baseline,
-    }
+
+def print_metrics(scan_elapsed):
+    http_seconds = _metrics["http_seconds"]
+    parse_seconds = _metrics["parse_seconds"]
+    requests_count = _metrics["requests"]
+
+    print("\n========== 計測結果 ==========")
+    print(f"HTTPリクエスト数: {requests_count}回")
+    print(f"HTTP通信時間合計: {http_seconds:.2f}秒")
+    print(f"HTML解析時間合計: {parse_seconds:.2f}秒")
+    print(f"施設チェック全体: {scan_elapsed:.2f}秒")
+
+    if requests_count:
+        print(
+            f"HTTP通信時間平均: "
+            f"{http_seconds / requests_count:.2f}秒/回"
+        )
+
+    print("\n施設別処理時間:")
+
+    facility_times = sorted(
+        _metrics["facility_times"].items(),
+        key=lambda item: item[1]["seconds"],
+        reverse=True,
+    )
+
+    for target_id, data in facility_times:
+        print(
+            f'  {data["seconds"]:7.2f}秒 '
+            f'{target_id} {data["name"]}'
+        )
+
+    print("==============================\n")
 
 
 def main():
@@ -736,7 +801,6 @@ def main():
             meta["release_done_targets"] = list(release_done)
 
         print("\n【27日 受付開始通知モード】")
-
     else:
         release_done = set()
 
@@ -754,7 +818,6 @@ def main():
         return
 
     months_to_scan = target_months(today)
-
     jobs = {}
 
     scan_started_at = time.monotonic()
@@ -801,6 +864,8 @@ def main():
                 )
 
     scan_elapsed = time.monotonic() - scan_started_at
+
+    print_metrics(scan_elapsed)
 
     print(f"\n施設チェック時間: {scan_elapsed:.1f}秒")
 
