@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -39,6 +40,16 @@ _metrics = {
     "http_seconds": 0.0,
     "parse_seconds": 0.0,
     "facility_times": {},
+    "validator_counts": {
+        "etag": 0,
+        "last_modified": 0,
+        "cache_control": 0,
+    },
+    "validator_samples": {
+        "etag": [],
+        "last_modified": [],
+        "cache_control": [],
+    },
 }
 
 DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
@@ -280,6 +291,23 @@ def fetch_html(url):
         ) as response:
             response.raise_for_status()
             response.encoding = "utf-8"
+
+            headers = {
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "cache_control": response.headers.get("Cache-Control"),
+            }
+
+            with _metrics_lock:
+                for key, value in headers.items():
+                    if value:
+                        _metrics["validator_counts"][key] += 1
+
+                        samples = _metrics["validator_samples"][key]
+
+                        if len(samples) < 3 and value not in samples:
+                            samples.append(value[:200])
+
             return response.text
     finally:
         elapsed = time.monotonic() - started
@@ -752,6 +780,21 @@ def print_metrics(scan_elapsed):
             f"HTTP通信時間平均: "
             f"{http_seconds / requests_count:.2f}秒/回"
         )
+
+    print("\nHTTPキャッシュ関連ヘッダー:")
+
+    for key, label in [
+        ("etag", "ETag"),
+        ("last_modified", "Last-Modified"),
+        ("cache_control", "Cache-Control"),
+    ]:
+        count = _metrics["validator_counts"][key]
+        samples = _metrics["validator_samples"][key]
+
+        print(f"  {label}: {count}/{requests_count}回")
+
+        for sample in samples:
+            print(f"    {sample}")
 
     print("\n施設別処理時間:")
 
