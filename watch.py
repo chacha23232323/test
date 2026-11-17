@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 STATE_PATH = Path("state.json")
@@ -32,18 +33,71 @@ COLOR_COMMON = 0x5865F2
 COMMON_CALENDAR_URL = os.environ.get("COMMON_CALENDAR_URL", "").strip()
 
 _thread_local = threading.local()
+_discord_session = None
+
+DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
+STATUS_CELL_PATTERN = re.compile(
+    r"(?:^|\s)(?:empty|a_little)(?:\s|$)"
+)
+
+WEEKDAY_MAP = {
+    "月": 0,
+    "火": 1,
+    "水": 2,
+    "木": 3,
+    "金": 4,
+    "土": 5,
+    "日": 6,
+}
+
+WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
 
 def get_session():
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
+
         session.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
         })
+
+        adapter = HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=2,
+            max_retries=0,
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
         _thread_local.session = session
 
     return _thread_local.session
+
+
+def get_discord_session():
+    global _discord_session
+
+    if _discord_session is None:
+        session = requests.Session()
+
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+        })
+
+        adapter = HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0,
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        _discord_session = session
+
+    return _discord_session
 
 
 def load_targets():
@@ -68,14 +122,6 @@ def load_targets():
 
 
 def parse_highlight_weekdays(label, line_number):
-    """
-    施設名末尾の曜日指定を解析する。
-
-    戻り値:
-      None       : 全曜日
-      set[int]   : 指定曜日のみ（月=0 ... 日=6）
-    """
-
     day_match = re.search(
         r"[（(]([^（）()]*)[）)]\s*$",
         label,
@@ -95,16 +141,6 @@ def parse_highlight_weekdays(label, line_number):
         day_text,
     )
 
-    weekday_map = {
-        "月": 0,
-        "火": 1,
-        "水": 2,
-        "木": 3,
-        "金": 4,
-        "土": 5,
-        "日": 6,
-    }
-
     if not normalized:
         raise RuntimeError(
             f"highlight.md {line_number}行目の曜日指定が空です"
@@ -113,13 +149,13 @@ def parse_highlight_weekdays(label, line_number):
     weekdays = set()
 
     for character in normalized:
-        if character not in weekday_map:
+        if character not in WEEKDAY_MAP:
             raise RuntimeError(
                 f"highlight.md {line_number}行目の曜日指定が正しくありません: "
                 f"{day_text}"
             )
 
-        weekdays.add(weekday_map[character])
+        weekdays.add(WEEKDAY_MAP[character])
 
     return weekdays
 
@@ -236,24 +272,25 @@ def target_months(today):
 
 
 def fetch_html(url):
-    response = get_session().get(
+    with get_session().get(
         url,
-        timeout=REQUEST_TIMEOUT
-    )
-    response.raise_for_status()
-
-    response.encoding = "utf-8"
-
-    return response.text
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        return response.text
 
 
 def detect_daily_statuses(html, year, month):
     soup = BeautifulSoup(html, "lxml")
     results = {}
 
-    for cell in soup.select("td.empty, td.a_little"):
+    for cell in soup.find_all(
+        "td",
+        class_=STATUS_CELL_PATTERN,
+    ):
         value = cell.get_text(" ", strip=True)
-        match = re.match(r"^\s*(\d{1,2})\s*", value)
+        match = DAY_PATTERN.match(value)
 
         if not match:
             continue
@@ -296,6 +333,7 @@ def save_state(state):
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
     os.replace(temp_path, STATE_PATH)
 
 
@@ -306,6 +344,8 @@ def discord_webhook(messages):
 
     if not webhook_url:
         raise RuntimeError("DISCORD_WEBHOOK_URL が未設定です")
+
+    session = get_discord_session()
 
     for message in messages:
         embeds = message.get("embeds", [])
@@ -324,61 +364,71 @@ def discord_webhook(messages):
 
         for attempt in range(DISCORD_MAX_RETRIES + 1):
             try:
-                response = requests.post(
+                with session.post(
                     webhook_url,
                     json=payload,
                     timeout=REQUEST_TIMEOUT,
-                )
+                ) as response:
+
+                    if response.status_code == 429:
+                        if attempt >= DISCORD_MAX_RETRIES:
+                            raise RuntimeError(
+                                f"Discord送信に失敗しました "
+                                f"(HTTP 429、再試行上限{DISCORD_MAX_RETRIES}回)"
+                            )
+
+                        retry_after = None
+
+                        try:
+                            retry_after = float(
+                                response.json().get("retry_after")
+                            )
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+
+                        if retry_after is None:
+                            try:
+                                retry_after = float(
+                                    response.headers.get(
+                                        "Retry-After",
+                                        "1",
+                                    )
+                                )
+                            except (ValueError, TypeError):
+                                retry_after = 1.0
+
+                        wait_time = max(
+                            0.0,
+                            min(retry_after, 60.0),
+                        )
+
+                        time.sleep(wait_time)
+                        continue
+
+                    if not 200 <= response.status_code < 300:
+                        error_text = response.text[:500]
+
+                        raise RuntimeError(
+                            f"Discord送信に失敗しました "
+                            f"(HTTP {response.status_code}: "
+                            f"{error_text})"
+                        )
+
+                    break
+
             except requests.RequestException as error:
                 raise RuntimeError(
                     f"Discord送信中に通信エラーが発生しました "
                     f"({type(error).__name__}: {error})"
                 ) from error
 
-            if response.status_code == 429:
-                if attempt >= DISCORD_MAX_RETRIES:
-                    raise RuntimeError(
-                        f"Discord送信に失敗しました "
-                        f"(HTTP 429、再試行上限{DISCORD_MAX_RETRIES}回)"
-                    )
-
-                retry_after = None
-
-                try:
-                    retry_after = float(
-                        response.json().get("retry_after")
-                    )
-                except (ValueError, TypeError, AttributeError):
-                    pass
-
-                if retry_after is None:
-                    try:
-                        retry_after = float(
-                            response.headers.get("Retry-After", "1")
-                        )
-                    except (ValueError, TypeError):
-                        retry_after = 1.0
-
-                time.sleep(max(0.0, min(retry_after, 60.0)))
-                continue
-
-            if not 200 <= response.status_code < 300:
-                raise RuntimeError(
-                    f"Discord送信に失敗しました "
-                    f"(HTTP {response.status_code}: "
-                    f"{response.text[:500]})"
-                )
-
-            break
-
 
 def format_japanese_date(day_text):
     day = date.fromisoformat(day_text)
-    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
 
     return (
         f"{day.year}年{day.month}月{day.day}日"
-        f"（{weekdays[day.weekday()]}）"
+        f"（{WEEKDAYS_JA[day.weekday()]}）"
     )
 
 
@@ -581,7 +631,13 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(target, today, previous_months, is_baseline):
+def scan_target(
+    target,
+    today,
+    months_to_scan,
+    previous_months,
+    is_baseline,
+):
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
@@ -591,8 +647,9 @@ def scan_target(target, today, previous_months, is_baseline):
     current_months = {}
     newly_available_entries = []
 
-    for year, month in target_months(today):
+    for year, month in months_to_scan:
         month_key = f"{year:04d}-{month:02d}"
+
         url = make_month_url(
             target["url"],
             year,
@@ -601,7 +658,13 @@ def scan_target(target, today, previous_months, is_baseline):
         )
 
         html = fetch_html(url)
-        current = detect_daily_statuses(html, year, month)
+
+        current = detect_daily_statuses(
+            html,
+            year,
+            month,
+        )
+
         current_months[month_key] = current
         previous = previous_months.get(month_key, {})
 
@@ -690,7 +753,11 @@ def main():
         print("27日の対象施設はすべて処理済みです。")
         return
 
+    months_to_scan = target_months(today)
+
     jobs = {}
+
+    scan_started_at = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for target in scan_targets:
@@ -708,6 +775,7 @@ def main():
                 scan_target,
                 target,
                 today,
+                months_to_scan,
                 previous_months,
                 is_baseline,
             )
@@ -731,6 +799,10 @@ def main():
                     f"ERROR target={target_id}: "
                     f"{type(error).__name__}: {error}"
                 )
+
+    scan_elapsed = time.monotonic() - scan_started_at
+
+    print(f"\n施設チェック時間: {scan_elapsed:.1f}秒")
 
     all_notices = []
     pending_tags = set()
@@ -781,23 +853,17 @@ def main():
             standard_title = "🆕"
             highlighted_title = "🚨"
 
-            highlighted_notices = [
-                entry
-                for entry in all_notices
+            highlighted_notices = []
+            standard_notices = []
+
+            for entry in all_notices:
                 if is_highlighted_entry(
                     entry,
                     highlighted_ids,
-                )
-            ]
-
-            standard_notices = [
-                entry
-                for entry in all_notices
-                if not is_highlighted_entry(
-                    entry,
-                    highlighted_ids,
-                )
-            ]
+                ):
+                    highlighted_notices.append(entry)
+                else:
+                    standard_notices.append(entry)
 
             notice_groups = [
                 (
@@ -825,8 +891,6 @@ def main():
                     max_block_chars=3800,
                 )
 
-                # 施設名はブロック生成時に保持しているため、
-                # next()による検索・照合は不要
                 for block in blocks:
                     block["embed_title"] = (
                         f'{title} {block["facility_name"]}'
