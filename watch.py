@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -33,24 +34,6 @@ COMMON_CALENDAR_URL = os.environ.get("COMMON_CALENDAR_URL", "").strip()
 
 _thread_local = threading.local()
 _discord_session = None
-_metrics_lock = threading.Lock()
-_metrics = {
-    "requests": 0,
-    "http_seconds": 0.0,
-    "parse_seconds": 0.0,
-    "facility_times": {},
-    "month_times": {},
-    "validator_counts": {
-        "etag": 0,
-        "last_modified": 0,
-        "cache_control": 0,
-    },
-    "validator_samples": {
-        "etag": [],
-        "last_modified": [],
-        "cache_control": [],
-    },
-}
 
 DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
 
@@ -282,89 +265,55 @@ def target_months(today):
 
 
 def fetch_html(url):
-    started = time.monotonic()
-
-    try:
-        with get_session().get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-        ) as response:
-            response.raise_for_status()
-            response.encoding = "utf-8"
-
-            headers = {
-                "etag": response.headers.get("ETag"),
-                "last_modified": response.headers.get("Last-Modified"),
-                "cache_control": response.headers.get("Cache-Control"),
-            }
-
-            with _metrics_lock:
-                for key, value in headers.items():
-                    if value:
-                        _metrics["validator_counts"][key] += 1
-
-                        samples = _metrics["validator_samples"][key]
-
-                        if len(samples) < 3 and value not in samples:
-                            samples.append(value[:200])
-
-            return response.text, response.status_code
-    finally:
-        elapsed = time.monotonic() - started
-
-        with _metrics_lock:
-            _metrics["requests"] += 1
-            _metrics["http_seconds"] += elapsed
+    with get_session().get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        return response.text
 
 
 def detect_daily_statuses(html, year, month):
-    started = time.monotonic()
+    if not html or not html.strip():
+        return {}
 
-    try:
-        if not html or not html.strip():
-            return {}
+    document = lxml_html.fromstring(html)
 
-        document = lxml_html.fromstring(html)
+    cells = document.xpath(
+        "//td[contains(concat(' ', normalize-space(@class), ' '), ' empty ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' a_little ')]"
+    )
 
-        cells = document.xpath(
-            "//td[contains(concat(' ', normalize-space(@class), ' '), ' empty ') "
-            "or contains(concat(' ', normalize-space(@class), ' '), ' a_little ')]"
+    results = {}
+
+    for cell in cells:
+        value = " ".join(
+            part.strip()
+            for part in cell.itertext()
+            if part.strip()
         )
 
-        results = {}
+        match = DAY_PATTERN.match(value)
 
-        for cell in cells:
-            value = " ".join(
-                part.strip()
-                for part in cell.itertext()
-                if part.strip()
-            )
+        if not match:
+            continue
 
-            match = DAY_PATTERN.match(value)
+        day = int(match.group(1))
 
-            if not match:
-                continue
+        try:
+            calendar_date = date(year, month, day)
+        except ValueError:
+            continue
 
-            day = int(match.group(1))
+        classes = (cell.get("class") or "").split()
 
-            try:
-                calendar_date = date(year, month, day)
-            except ValueError:
-                continue
+        if "a_little" in classes:
+            results[calendar_date.isoformat()] = "△"
+        elif "empty" in classes:
+            results[calendar_date.isoformat()] = "○"
 
-            classes = (cell.get("class") or "").split()
-
-            if "a_little" in classes:
-                results[calendar_date.isoformat()] = "△"
-            elif "empty" in classes:
-                results[calendar_date.isoformat()] = "○"
-
-        return results
-    finally:
-        elapsed = time.monotonic() - started
-
-        with _metrics_lock:
-            _metrics["parse_seconds"] += elapsed
+    return results
 
 
 def load_state():
@@ -693,8 +642,6 @@ def scan_target(
     previous_months,
     is_baseline,
 ):
-    target_started = time.monotonic()
-
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
@@ -704,167 +651,59 @@ def scan_target(
     current_months = {}
     newly_available_entries = []
 
-    try:
-        for year, month in months_to_scan:
-            month_key = f"{year:04d}-{month:02d}"
+    for year, month in months_to_scan:
+        month_key = f"{year:04d}-{month:02d}"
 
-            url = make_month_url(
-                target["url"],
-                year,
-                month,
-                base_date,
-            )
+        url = make_month_url(
+            target["url"],
+            year,
+            month,
+            base_date,
+        )
 
-            month_started = time.monotonic()
-            request_seconds = None
-            parse_seconds = 0.0
-            status_code = None
+        html = fetch_html(url)
 
-            try:
-                html, status_code = fetch_html(url)
-                request_seconds = time.monotonic() - month_started
+        current = detect_daily_statuses(
+            html,
+            year,
+            month,
+        )
 
-                parse_started = time.monotonic()
+        current_months[month_key] = current
+        previous = previous_months.get(month_key, {})
 
-                current = detect_daily_statuses(
-                    html,
-                    year,
-                    month,
-                )
+        if is_baseline or month_key not in previous_months:
+            continue
 
-                parse_seconds = time.monotonic() - parse_started
-
-                current_months[month_key] = current
-                previous = previous_months.get(month_key, {})
-
-                if is_baseline or month_key not in previous_months:
-                    continue
-
-                newly_available = {
-                    day: status
-                    for day, status in current.items()
-                    if day not in previous
-                }
-
-                for day, status in newly_available.items():
-                    newly_available_entries.append({
-                        "target_id": target_id,
-                        "name": name,
-                        "location": location,
-                        "day": day,
-                        "status": status,
-                        "nights": nights,
-                        "trip_purpose": target.get("trip_purpose", ""),
-                        "bike_trip": target.get("bike_trip", ""),
-                        "url": target.get("access_url", url),
-                    })
-
-            finally:
-                month_elapsed = time.monotonic() - month_started
-
-                if request_seconds is None:
-                    request_seconds = month_elapsed
-
-                with _metrics_lock:
-                    _metrics["month_times"][
-                        (target_id, month_key)
-                    ] = {
-                        "name": name,
-                        "request_seconds": request_seconds,
-                        "parse_seconds": parse_seconds,
-                        "status_code": status_code,
-                    }
-
-        return {
-            "target_id": target_id,
-            "months": current_months,
-            "entries": newly_available_entries,
-            "is_baseline": is_baseline,
+        newly_available = {
+            day: status
+            for day, status in current.items()
+            if day not in previous
         }
-    finally:
-        elapsed = time.monotonic() - target_started
 
-        with _metrics_lock:
-            _metrics["facility_times"][target_id] = {
+        for day, status in newly_available.items():
+            newly_available_entries.append({
+                "target_id": target_id,
                 "name": name,
-                "seconds": elapsed,
-            }
+                "location": location,
+                "day": day,
+                "status": status,
+                "nights": nights,
+                "trip_purpose": target.get("trip_purpose", ""),
+                "bike_trip": target.get("bike_trip", ""),
+                "url": target.get("access_url", url),
+            })
 
-
-def print_metrics(scan_elapsed):
-    http_seconds = _metrics["http_seconds"]
-    parse_seconds = _metrics["parse_seconds"]
-    requests_count = _metrics["requests"]
-
-    print("\n========== 計測結果 ==========")
-    print(f"HTTPリクエスト数: {requests_count}回")
-    print(f"HTTP通信時間合計: {http_seconds:.2f}秒")
-    print(f"HTML解析時間合計: {parse_seconds:.2f}秒")
-    print(f"施設チェック全体: {scan_elapsed:.2f}秒")
-
-    if requests_count:
-        print(
-            f"HTTP通信時間平均: "
-            f"{http_seconds / requests_count:.2f}秒/回"
-        )
-
-    print("\nHTTPキャッシュ関連ヘッダー:")
-
-    for key, label in [
-        ("etag", "ETag"),
-        ("last_modified", "Last-Modified"),
-        ("cache_control", "Cache-Control"),
-    ]:
-        count = _metrics["validator_counts"][key]
-        samples = _metrics["validator_samples"][key]
-
-        print(f"  {label}: {count}/{requests_count}回")
-
-        for sample in samples:
-            print(f"    {sample}")
-
-    print("\n月別HTTP取得時間:")
-
-    month_times = sorted(
-        _metrics["month_times"].items(),
-        key=lambda item: item[1]["request_seconds"],
-        reverse=True,
-    )
-
-    for (target_id, month_key), data in month_times:
-        status = (
-            f'HTTP {data["status_code"]}'
-            if data["status_code"] is not None
-            else "失敗"
-        )
-
-        print(
-            f'  {data["request_seconds"]:7.2f}秒 '
-            f'{status:10} '
-            f'{target_id} {data["name"]} {month_key} '
-            f'(解析 {data["parse_seconds"]:.3f}秒)'
-        )
-
-    print("\n施設別処理時間:")
-
-    facility_times = sorted(
-        _metrics["facility_times"].items(),
-        key=lambda item: item[1]["seconds"],
-        reverse=True,
-    )
-
-    for target_id, data in facility_times:
-        print(
-            f'  {data["seconds"]:7.2f}秒 '
-            f'{target_id} {data["name"]}'
-        )
-
-    print("==============================\n")
+    return {
+        "target_id": target_id,
+        "months": current_months,
+        "entries": newly_available_entries,
+        "is_baseline": is_baseline,
+    }
 
 
 def main():
-    started_at = datetime.now(JST)
-    today = started_at.date()
+    today = datetime.now(JST).date()
 
     targets = load_targets()
     highlighted_ids = load_highlighted_ids(targets)
@@ -919,8 +758,6 @@ def main():
     months_to_scan = target_months(today)
     jobs = {}
 
-    scan_started_at = time.monotonic()
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for target in scan_targets:
             target_id = str(target["id"])
@@ -961,12 +798,6 @@ def main():
                     f"ERROR target={target_id}: "
                     f"{type(error).__name__}: {error}"
                 )
-
-    scan_elapsed = time.monotonic() - scan_started_at
-
-    print_metrics(scan_elapsed)
-
-    print(f"\n施設チェック時間: {scan_elapsed:.1f}秒")
 
     all_notices = []
     pending_tags = set()
@@ -1178,13 +1009,6 @@ def main():
             f"\n通知なしで基準を作成した施設数: "
             f"{baseline_count}"
         )
-
-    elapsed = (
-        datetime.now(JST) - started_at
-    ).total_seconds()
-
-    print(f"\n処理時間: {elapsed:.1f}秒")
-    print(f"同時アクセス上限: {MAX_WORKERS}施設")
 
     if failures:
         print("失敗した施設:", ", ".join(failures))
