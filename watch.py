@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -40,6 +39,7 @@ _metrics = {
     "http_seconds": 0.0,
     "parse_seconds": 0.0,
     "facility_times": {},
+    "month_times": {},
     "validator_counts": {
         "etag": 0,
         "last_modified": 0,
@@ -308,7 +308,7 @@ def fetch_html(url):
                         if len(samples) < 3 and value not in samples:
                             samples.append(value[:200])
 
-            return response.text
+            return response.text, response.status_code
     finally:
         elapsed = time.monotonic() - started
 
@@ -715,38 +715,65 @@ def scan_target(
                 base_date,
             )
 
-            html = fetch_html(url)
+            month_started = time.monotonic()
+            request_seconds = None
+            parse_seconds = 0.0
+            status_code = None
 
-            current = detect_daily_statuses(
-                html,
-                year,
-                month,
-            )
+            try:
+                html, status_code = fetch_html(url)
+                request_seconds = time.monotonic() - month_started
 
-            current_months[month_key] = current
-            previous = previous_months.get(month_key, {})
+                parse_started = time.monotonic()
 
-            if is_baseline or month_key not in previous_months:
-                continue
+                current = detect_daily_statuses(
+                    html,
+                    year,
+                    month,
+                )
 
-            newly_available = {
-                day: status
-                for day, status in current.items()
-                if day not in previous
-            }
+                parse_seconds = time.monotonic() - parse_started
 
-            for day, status in newly_available.items():
-                newly_available_entries.append({
-                    "target_id": target_id,
-                    "name": name,
-                    "location": location,
-                    "day": day,
-                    "status": status,
-                    "nights": nights,
-                    "trip_purpose": target.get("trip_purpose", ""),
-                    "bike_trip": target.get("bike_trip", ""),
-                    "url": target.get("access_url", url),
-                })
+                current_months[month_key] = current
+                previous = previous_months.get(month_key, {})
+
+                if is_baseline or month_key not in previous_months:
+                    continue
+
+                newly_available = {
+                    day: status
+                    for day, status in current.items()
+                    if day not in previous
+                }
+
+                for day, status in newly_available.items():
+                    newly_available_entries.append({
+                        "target_id": target_id,
+                        "name": name,
+                        "location": location,
+                        "day": day,
+                        "status": status,
+                        "nights": nights,
+                        "trip_purpose": target.get("trip_purpose", ""),
+                        "bike_trip": target.get("bike_trip", ""),
+                        "url": target.get("access_url", url),
+                    })
+
+            finally:
+                month_elapsed = time.monotonic() - month_started
+
+                if request_seconds is None:
+                    request_seconds = month_elapsed
+
+                with _metrics_lock:
+                    _metrics["month_times"][
+                        (target_id, month_key)
+                    ] = {
+                        "name": name,
+                        "request_seconds": request_seconds,
+                        "parse_seconds": parse_seconds,
+                        "status_code": status_code,
+                    }
 
         return {
             "target_id": target_id,
@@ -795,6 +822,28 @@ def print_metrics(scan_elapsed):
 
         for sample in samples:
             print(f"    {sample}")
+
+    print("\n月別HTTP取得時間:")
+
+    month_times = sorted(
+        _metrics["month_times"].items(),
+        key=lambda item: item[1]["request_seconds"],
+        reverse=True,
+    )
+
+    for (target_id, month_key), data in month_times:
+        status = (
+            f'HTTP {data["status_code"]}'
+            if data["status_code"] is not None
+            else "失敗"
+        )
+
+        print(
+            f'  {data["request_seconds"]:7.2f}秒 '
+            f'{status:10} '
+            f'{target_id} {data["name"]} {month_key} '
+            f'(解析 {data["parse_seconds"]:.3f}秒)'
+        )
 
     print("\n施設別処理時間:")
 
