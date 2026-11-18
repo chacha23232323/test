@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date
 from urllib.parse import urljoin, urlsplit
 
@@ -12,6 +13,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from booking_ledger import BookingLedger
+from finish_booking import config_from_env, final_submission, gmail_headers
 
 BASE_URL = "https://as.its-kenpo.or.jp"
 TIMEOUT = (10, 30)
@@ -27,6 +29,7 @@ def parse_args():
     parser.add_argument("--room-persons", required=True, help="Comma-separated guests per room")
     parser.add_argument("--room-number", type=int, help="Preferred room number; otherwise first room that fits")
     parser.add_argument("--email", default=os.environ.get("BOOKING_EMAIL", ""))
+    parser.add_argument("--finish-from-gmail", action="store_true")
     return parser.parse_args()
 
 
@@ -34,8 +37,9 @@ def fail(message):
     raise RuntimeError(message)
 
 
-def get_apply_url(facility_id):
-    data = json.loads(open("targets.json", encoding="utf-8").read())
+def get_apply_target(facility_id):
+    with open("targets.json", encoding="utf-8-sig") as handle:
+        data = json.load(handle)
     for target in data.get("targets", []):
         if str(target.get("id")) == str(facility_id):
             apply_url = target.get("access_url", "").strip()
@@ -43,7 +47,7 @@ def get_apply_url(facility_id):
                 fail(f"{facility_id} に access_url がありません")
             if not apply_url.startswith("https://as.its-kenpo.or.jp/apply/empty_new?"):
                 fail(f"{facility_id} の access_url が申込ページ形式ではありません")
-            return apply_url
+            return target, apply_url
     fail(f"targets.json に施設ID {facility_id} がありません")
 
 
@@ -150,6 +154,12 @@ def main():
         if status == "pending":
             print(f"::warning::{args.facility_id} {args.date}: 前回の結果が未確定です。確認メールと申込状況を確認してください。")
             return
+        if status == "finalizing":
+            print("::warning::最終送信の結果が未確定です。受付メールを確認してください。")
+            return
+        if status == "accepted":
+            print(f"{args.facility_id} {args.date}: 申込受付済みです。")
+            return
         if status == "email_sent":
             print(f"{args.facility_id} {args.date}: 確認メール送信済みです。")
             return
@@ -160,7 +170,22 @@ def main():
     if sum(room_persons) != args.persons:
         fail("The room guest counts must add up to --persons")
 
-    apply_url = get_apply_url(args.facility_id)
+    target, apply_url = get_apply_target(args.facility_id)
+    finish_enabled = args.finish_from_gmail
+    if finish_enabled and ledger is None:
+        fail("Gmailによる自動確定は GitHub Actions から実行してください")
+    booking_name = (target.get("booking_name") or target.get("name") or "").strip()
+    if finish_enabled:
+        if not booking_name:
+            fail("対象施設の name または booking_name が設定されていません")
+        if (args.nights, args.persons, args.rooms, room_persons) != (1, 2, 1, [2]):
+            fail("Gmailによる自動確定は1泊・2名・1室のみ対応します")
+        try:
+            oauth, profile = config_from_env()
+            headers = gmail_headers(oauth, args.email)
+        except Exception as error:
+            raise RuntimeError(f"Gmailまたは代表者設定の事前確認に失敗しました ({type(error).__name__})") from None
+
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
     response = session.get(apply_url, timeout=TIMEOUT)
@@ -276,16 +301,34 @@ def main():
     create_url = booking_url(response.url, form.get("action", ""))
     sha = ledger.write("pending") if ledger else None
     try:
-        request_confirmation_email(session, create_url, form_data, args.email)
+        since_ms = request_confirmation_email(session, create_url, form_data, args.email)
         if ledger:
-            ledger.write("email_sent", sha)
+            sha = ledger.write("email_sent", sha)
     except Exception as error:
         raise RuntimeError(
             f"部屋選択以降の結果を確定できません ({type(error).__name__})。"
             "再実行する前に確認メールと申込状況を確認してください。"
         ) from None
     print(f"部屋番号 {chosen[0]} の確認メール送信完了画面を確認しました。")
-    print("確認メール内のURLを開いて申込を完了してください。")
+    if not finish_enabled:
+        print("確認メール内のURLを開いて申込を完了してください。")
+        return
+
+    def mark_finalizing():
+        nonlocal sha
+        sha = ledger.write("finalizing", sha)
+
+    try:
+        with requests.Session() as browser:
+            final_submission(
+                browser, headers, profile, since_ms, args.date, booking_name, mark_finalizing
+            )
+        ledger.write("accepted", sha)
+    except Exception as error:
+        # HTTP exceptions can include the booking URL. Keep it out of Action logs.
+        detail = str(error) if type(error) is RuntimeError else type(error).__name__
+        raise RuntimeError(f"自動確定を確認できません: {detail}。Gmailと申込記録を確認してください。") from None
+    print("申込完了画面と受付番号を確認しました。宿泊者の詳細登録は受付メールから行ってください。")
 
 
 def request_confirmation_email(session, create_url, form_data, email):
@@ -301,10 +344,12 @@ def request_confirmation_email(session, create_url, form_data, email):
     if "/apply/email_input" not in final.url and not final_page.select_one("input[name='email']"):
         fail("同意後のメール入力画面を確認できませんでした")
 
+    since_ms = time.time_ns() // 1_000_000
     sent = submit_email(session, final_page, final.url, email)
     sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
     if sent_path != "/apply/send_complete":
         fail("確認メール送信後の完了画面を確認できませんでした")
+    return since_ms
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ class BookingLedger:
             raise RuntimeError(f"申込記録の読み取りに失敗しました (HTTP {result.status_code})")
         record = json.loads(base64.b64decode(result.json()["content"]))
         status = record.get("status")
-        if status not in ("pending", "email_sent"):
+        if status not in ("pending", "email_sent", "finalizing", "accepted"):
             raise RuntimeError("既存の申込記録の状態を確認できません")
         return status
 

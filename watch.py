@@ -265,8 +265,9 @@ def run_auto_bookings(bookings, results, today):
                 subprocess.run(
                     [sys.executable, str(Path(__file__).with_name("apply_booking.py")),
                      "--facility-id", facility_id, "--date", day, "--nights", "1",
-                     "--persons", "2", "--rooms", "1", "--room-persons", "2"],
-                    check=True, timeout=150,
+                     "--persons", "2", "--rooms", "1", "--room-persons", "2",
+                     "--finish-from-gmail"],
+                    check=True, timeout=270,
                 )
             except (subprocess.SubprocessError, OSError) as error:
                 print(f"自動申込を確認できませんでした: {facility_id} {day} ({type(error).__name__})")
@@ -767,15 +768,14 @@ def main():
     highlighted_ids = load_highlighted_ids(targets)
     auto_bookings = {}
     auto_ok = True
-    if os.environ.get("AUTO_BOOKING_ENABLED") == "true":
-        try:
-            if os.environ.get("GITHUB_ACTIONS") != "true":
-                raise RuntimeError("自動申込は GitHub Actions から実行してください")
-            auto_bookings = load_auto_bookings(targets)
-        except (ValueError, RuntimeError) as error:
-            print(f"自動申込設定エラー: {error}")
-            auto_ok = False
-
+    try:
+        auto_bookings = load_auto_bookings(targets)
+        if auto_bookings and os.environ.get("GITHUB_ACTIONS") != "true":
+            auto_bookings = {}
+            raise RuntimeError("自動申込は GitHub Actions から実行してください")
+    except (ValueError, RuntimeError) as error:
+        print(f"自動申込設定エラー: {error}")
+        auto_ok = False
     print(
         f"監視対象: {len(targets)}施設、"
         f"注目施設: {len(highlighted_ids)}施設"
