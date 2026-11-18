@@ -121,6 +121,22 @@ def main():
         fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
 
     form_data = form_values(form)
+    print("=== 申込フォーム診断 ===")
+    print("GET redirect history:", [
+        (r.status_code, r.url.split("?")[0])
+        for r in response.history
+    ])
+    print("GET final URL:", response.url.split("?")[0])
+    print("Form action:", form.get("action"))
+    print("Form method:", form.get("method"))
+    print("Form fields:", [
+        item.get("name")
+        for item in form.select("input, select, textarea")
+        if item.get("name")
+    ])
+    print("Form data keys:", list(form_data.keys()))
+    print("Session cookie names:", list(session.cookies.keys()))
+    print("=== 診断ここまで ===")
 
     dates = {option.get("value") for option in form.select("select[name='apply[join_time]'] option")}
     if args.date not in dates:
