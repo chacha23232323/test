@@ -196,7 +196,22 @@ def main():
     })
     for index, count in enumerate(room_persons, start=1):
         form_data[f"apply[hope_room{index}]"] = str(count)
-
+    print("=== 空室検索送信データ診断 ===")
+    
+    for key in [
+        "apply[join_time]",
+        "apply[night_count]",
+        "apply[stay_persons]",
+        "apply[hope_rooms]",
+        "apply[hope_room1]",
+        "apply[hope_room2]",
+    ]:
+        print(f"{key}: {form_data.get(key)}")
+    
+    print("送信データ項目数:", len(form_data))
+    print("CSRFトークンあり:", bool(form_data.get("authenticity_token")))
+    
+    print("=== 診断ここまで ===")
     search_button = page.select_one("input[value='空き検索'][onclick]")
     token_match = re.search(r"coma_search\(['\"]([^'\"]+)", search_button.get("onclick", "")) if search_button else None
     print("=== 空き検索ボタン診断 ===")
