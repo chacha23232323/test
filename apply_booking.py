@@ -142,6 +142,17 @@ def main():
     search_response = session.post(search_url, data=form_data, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=TIMEOUT)
     search_response.raise_for_status()
     results = BeautifulSoup(search_response.text, "lxml")
+    print("=== 空室検索レスポンス診断 ===")
+    print("HTTP status:", search_response.status_code)
+    print("Content-Type:", search_response.headers.get("Content-Type"))
+    print("Response URL:", search_response.url.split("?")[0])
+    print("HTML title:", results.title.get_text(strip=True) if results.title else "(なし)")
+    print("Response text:", results.get_text(" ", strip=True)[:1500])
+    print("Checkbox count:", len(results.select("input[type='checkbox']")))
+    print("Checkbox names:", [
+        item.get("name") for item in results.select("input[type='checkbox']")
+    ][:20])
+    print("=== 診断ここまで ===")
     checkboxes = results.select("#coma_search_result input[type='checkbox'][name^='apply[coma[' ]")
     if not checkboxes:
         # The server can return a full page or an AJAX fragment depending on session state.
