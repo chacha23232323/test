@@ -139,8 +139,23 @@ def main():
     if not token_match:
         fail("空き検索用のページ情報を特定できません")
     search_url = urljoin(response.url, "empty_new?s=" + token_match.group(1))
-    search_response = session.post(search_url, data=form_data, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=TIMEOUT)
+    search_response = session.post(
+        search_url,
+        data=form_data,
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        timeout=TIMEOUT
+    )
     search_response.raise_for_status()
+
+    print("=== POSTリダイレクト診断 ===")
+    print("POST redirect history:", [
+        (r.status_code, r.url.split("?")[0])
+        for r in search_response.history
+    ])
+    print("POST response headers:", dict(search_response.headers))
+    print("Final response URL:", search_response.url)
+    print("=== 診断ここまで ===")
+
     results = BeautifulSoup(search_response.text, "lxml")
     print("=== 空室検索レスポンス診断 ===")
     print("HTTP status:", search_response.status_code)
