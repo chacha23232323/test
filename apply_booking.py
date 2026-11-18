@@ -33,8 +33,12 @@ def parse_args():
     return parser.parse_args()
 
 
+class BookingFlowError(RuntimeError):
+    """A fixed diagnostic that is safe to print in Actions."""
+
+
 def fail(message):
-    raise RuntimeError(message)
+    raise BookingFlowError(message)
 
 
 def get_apply_target(facility_id):
@@ -303,10 +307,10 @@ def main():
     try:
         since_ms = request_confirmation_email(session, create_url, form_data, args.email)
         if ledger:
-            sha = ledger.write("email_sent", sha)
+            sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
     except Exception as error:
         raise RuntimeError(
-            f"部屋選択以降の結果を確定できません ({type(error).__name__})。"
+            f"部屋選択以降の結果を確定できません。詳細: {booking_failure_detail(error)}。"
             "再実行する前に確認メールと申込状況を確認してください。"
         ) from None
     print(f"部屋番号 {chosen[0]} の確認メール送信完了画面を確認しました。")
@@ -331,21 +335,39 @@ def main():
     print("申込完了画面と受付番号を確認しました。宿泊者の詳細登録は受付メールから行ってください。")
 
 
+def booking_failure_detail(error):
+    if isinstance(error, BookingFlowError):
+        return str(error)
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        return f"HTTP {error.response.status_code}"
+    return type(error).__name__
+
+
+def booking_step(label, operation, *args):
+    try:
+        return operation(*args)
+    except Exception as error:
+        raise BookingFlowError(f"{label}: {booking_failure_detail(error)}") from None
+
+
 def request_confirmation_email(session, create_url, form_data, email):
+    print("部屋選択リクエストを送信します", flush=True)
     final = session.post(create_url, data=form_data, timeout=TIMEOUT, allow_redirects=True)
     final.raise_for_status()
     final_page = BeautifulSoup(final.text, "lxml")
     if "申込データにエラー" in final_page.get_text(" ", strip=True):
         fail("施設側で申込エラーになりました。部屋は選択されていない可能性があります")
     if "/apply/rule" in final.url or "個人情報の取り扱い" in final_page.get_text(" ", strip=True):
-        final = submit_consent(session, final_page, final.url)
+        print("同意画面を確認しました", flush=True)
+        final = booking_step("同意操作", submit_consent, session, final_page, final.url)
         final_page = BeautifulSoup(final.text, "lxml")
 
     if "/apply/email_input" not in final.url and not final_page.select_one("input[name='email']"):
         fail("同意後のメール入力画面を確認できませんでした")
 
     since_ms = time.time_ns() // 1_000_000
-    sent = submit_email(session, final_page, final.url, email)
+    print("メール入力画面を確認しました", flush=True)
+    sent = booking_step("メール送信", submit_email, session, final_page, final.url, email)
     sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
     if sent_path != "/apply/send_complete":
         fail("確認メール送信後の完了画面を確認できませんでした")
