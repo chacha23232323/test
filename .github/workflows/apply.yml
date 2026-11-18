@@ -1,4 +1,4 @@
-name: ITS Kenpo apply
+name:apply
 
 on:
   workflow_dispatch:
