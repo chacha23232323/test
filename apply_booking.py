@@ -47,12 +47,36 @@ def get_apply_url(facility_id):
 
 def form_values(form):
     values = {}
+
     for field in form.select("input[name], select[name], textarea[name]"):
-        field_type = field.get("type", "").lower()
-        if field_type in ("submit", "button", "checkbox", "radio", "file"):
+        name = field.get("name")
+        if not name or field.has_attr("disabled"):
             continue
-        if field_type == "hidden" or field.name in ("input", "textarea"):
-            values[field["name"]] = field.get("value", "")
+
+        tag = field.name
+        field_type = field.get("type", "").lower()
+
+        if tag == "input":
+            if field_type in ("submit", "button", "reset", "file"):
+                continue
+
+            if field_type in ("checkbox", "radio"):
+                if not field.has_attr("checked"):
+                    continue
+
+            values[name] = field.get("value", "")
+
+        elif tag == "select":
+            selected = field.select_one("option[selected]")
+            if selected is None:
+                selected = field.select_one("option")
+
+            if selected:
+                values[name] = selected.get("value", selected.get_text(strip=True))
+
+        elif tag == "textarea":
+            values[name] = field.get_text()
+
     return values
 
 
