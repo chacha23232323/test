@@ -15,9 +15,7 @@ concurrency:
 
 jobs:
   test:
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || vars.AUTO_BOOKING_ENABLED == 'true')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -50,7 +48,8 @@ jobs:
         env:
           BOOKING_BRANCH: main
           BOOKING_GITHUB_TOKEN: ${{ github.token }}
-          AUTO_BOOKING_ENABLED: ${{ vars.AUTO_BOOKING_ENABLED }}
+          BOOKING_GMAIL_OAUTH: ${{ secrets.BOOKING_GMAIL_OAUTH }}
+          BOOKING_APPLICANT: ${{ secrets.BOOKING_APPLICANT }}
           BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           COMMON_CALENDAR_URL: ${{ secrets.COMMON_CALENDAR_URL }}
