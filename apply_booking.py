@@ -125,6 +125,20 @@ def main():
     print("=== 診断ここまで ===")
     
     page = BeautifulSoup(response.text, "lxml")
+    print("=== coma_search 定義の診断 ===")
+
+    print("外部JavaScript:")
+    for script in page.select("script[src]"):
+        print(script.get("src"))
+    
+    print("インラインJavaScript:")
+    for script in page.select("script"):
+        script_text = script.get_text()
+        if "coma_search" in script_text:
+            pos = script_text.find("coma_search")
+            print(script_text[max(0, pos - 300):pos + 1800])
+    
+    print("=== 診断ここまで ===")
     form = page.select_one("form#new_apply")
     if not form:
         fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
@@ -182,7 +196,6 @@ def main():
         (r.status_code, r.url.split("?")[0])
         for r in search_response.history
     ])
-    print("POST response headers:", dict(search_response.headers))
     print("Final response URL:", search_response.url)
     print("=== 診断ここまで ===")
 
