@@ -6,10 +6,12 @@ import os
 import re
 import sys
 from datetime import date
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+
+from booking_ledger import BookingLedger
 
 BASE_URL = "https://as.its-kenpo.or.jp"
 TIMEOUT = (10, 30)
@@ -80,6 +82,14 @@ def form_values(form):
     return values
 
 
+def booking_url(current_url, destination):
+    url = urljoin(current_url, destination)
+    parsed = urlsplit(url)
+    if (parsed.scheme, parsed.netloc) != ("https", urlsplit(BASE_URL).netloc):
+        fail("ITS健保以外の申込先が指定されました")
+    return url
+
+
 def submit_consent(session, page, current_url):
     control = next((element for element in page.select("input,button")
                     if (element.get("value") or element.get_text(" ", strip=True)) == "同意する"), None)
@@ -87,7 +97,7 @@ def submit_consent(session, page, current_url):
         fail("個人情報の取扱い同意ボタンが見つかりません")
     form = control.find_parent("form")
     if form:
-        action = urljoin(current_url, form.get("action", current_url))
+        action = booking_url(current_url, form.get("action", current_url))
         method = form.get("method", "post").lower()
         values = form_values(form)
         if control.get("name"):
@@ -101,7 +111,7 @@ def submit_consent(session, page, current_url):
     match = re.search(r"(?:location(?:\.href)?\s*=|window\.location\s*=|window\.open\()\s*['\"]([^'\"]+)", onclick)
     destination = href or (match.group(1) if match else None)
     if destination:
-        response = session.get(urljoin(current_url, destination), timeout=TIMEOUT, allow_redirects=True)
+        response = session.get(booking_url(current_url, destination), timeout=TIMEOUT, allow_redirects=True)
         response.raise_for_status()
         return response
     fail("同意操作の送信方法を特定できません")
@@ -110,11 +120,11 @@ def submit_consent(session, page, current_url):
 def submit_email(session, page, current_url, email):
     if not email or "@" not in email:
         fail("BOOKING_EMAILに有効なメールアドレスを設定してください")
-    form = page.select_one("form")
     field = page.select_one("input[name='email']")
+    form = field.find_parent("form") if field else None
     if not form or not field:
         fail("メールアドレス入力フォームが見つかりません")
-    action = urljoin(current_url, form.get("action", current_url))
+    action = booking_url(current_url, form.get("action", current_url))
     values = form_values(form)
     values[field["name"]] = email
     submit = form.select_one("input[type='submit'][name],button[type='submit'][name]")
@@ -127,7 +137,23 @@ def submit_email(session, page, current_url, email):
 
 def main():
     args = parse_args()
-    date.fromisoformat(args.date)
+    if date.fromisoformat(args.date).isoformat() != args.date:
+        fail("宿泊日は YYYY-MM-DD で指定してください")
+    args.email = args.email.strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+", args.email):
+        fail("BOOKING_EMAILに有効なメールアドレスを設定してください")
+
+    ledger = None
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        ledger = BookingLedger(args.facility_id, args.date)
+        status = ledger.existing_status()
+        if status == "pending":
+            print(f"::warning::{args.facility_id} {args.date}: 前回の結果が未確定です。確認メールと申込状況を確認してください。")
+            return
+        if status == "email_sent":
+            print(f"{args.facility_id} {args.date}: 確認メール送信済みです。")
+            return
+
     room_persons = [int(value) for value in args.room_persons.split(",")]
     if len(room_persons) != args.rooms or any(value < 1 for value in room_persons):
         fail("--room-persons must give one positive guest count for every requested room")
@@ -139,69 +165,17 @@ def main():
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
     response = session.get(apply_url, timeout=TIMEOUT)
     response.raise_for_status()
-    print("=== GETリダイレクト詳細 ===")
-
-    for i, item in enumerate(response.history):
-        print(f"Redirect {i + 1}")
-        print("Status:", item.status_code)
-        print("From:", item.url)
-        print("Location:", item.headers.get("Location"))
-    
-    print("Final status:", response.status_code)
-    print("Final URL:", response.url)
-    
-    print("=== 診断ここまで ===")
-    
-    print("=== GETリダイレクト診断 ===")
-    print("GET redirect history:", [
-        (r.status_code, r.url.split("?")[0])
-        for r in response.history
-    ])
-    print("GET final URL:", response.url)
-    print("=== 診断ここまで ===")
-    
     page = BeautifulSoup(response.text, "lxml")
-    print("=== coma_search 定義の診断 ===")
-
-    print("外部JavaScript:")
-    for script in page.select("script[src]"):
-        print(script.get("src"))
-    
-    print("インラインJavaScript:")
-    for script in page.select("script"):
-        script_text = script.get_text()
-        if "coma_search" in script_text:
-            pos = script_text.find("coma_search")
-            print(script_text[max(0, pos - 300):pos + 1800])
-    
-    print("=== 診断ここまで ===")
     form = page.select_one("form#new_apply")
     csrf_meta = page.select_one('meta[name="csrf-token"]')
     csrf_token = csrf_meta.get("content") if csrf_meta else ""
-    
+
     if not csrf_token:
         raise RuntimeError("CSRF tokenが取得できません")
     if not form:
         fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
 
     form_data = form_values(form)
-    print("=== 申込フォーム診断 ===")
-    print("GET redirect history:", [
-        (r.status_code, r.url.split("?")[0])
-        for r in response.history
-    ])
-    print("GET final URL:", response.url.split("?")[0])
-    print("Form action:", form.get("action"))
-    print("Form method:", form.get("method"))
-    print("Form fields:", [
-        item.get("name")
-        for item in form.select("input, select, textarea")
-        if item.get("name")
-    ])
-    print("Form data keys:", list(form_data.keys()))
-    print("Session cookie names:", list(session.cookies.keys()))
-    print("=== 診断ここまで ===")
-
     dates = {option.get("value") for option in form.select("select[name='apply[join_time]'] option")}
     if args.date not in dates:
         fail("指定日は現在申込可能な日付一覧にありません")
@@ -213,107 +187,24 @@ def main():
     })
     for index, count in enumerate(room_persons, start=1):
         form_data[f"apply[hope_room{index}]"] = str(count)
-    print("=== 空室検索送信データ診断 ===")
-    
-    for key in [
-        "apply[join_time]",
-        "apply[night_count]",
-        "apply[stay_persons]",
-        "apply[hope_rooms]",
-        "apply[hope_room1]",
-        "apply[hope_room2]",
-    ]:
-        print(f"{key}: {form_data.get(key)}")
-    
-    print("送信データ項目数:", len(form_data))
-    print("CSRFトークンあり:", bool(form_data.get("authenticity_token")))
-    
-    print("=== 診断ここまで ===")
     search_button = page.select_one("input[value='空き検索'][onclick]")
     token_match = re.search(r"coma_search\(['\"]([^'\"]+)", search_button.get("onclick", "")) if search_button else None
-    print("=== 空き検索ボタン診断 ===")
-    print("Button onclick:", search_button.get("onclick") if search_button else "(なし)")
-    print("Extracted token:", token_match.group(1) if token_match else "(なし)")
-    print("Form action:", form.get("action"))
-    print("=== 診断ここまで ===")
     if not token_match:
         fail("空き検索用のページ情報を特定できません")
-    search_url = urljoin(response.url, "empty_new?s=" + token_match.group(1))
+    search_url = booking_url(response.url, "empty_new?s=" + token_match.group(1))
     search_response = session.post(
         search_url,
         data=form_data,
-    headers={
-        "X-Requested-With": "XMLHttpRequest",
-        "X-CSRF-Token": csrf_token,
-        "Referer": response.url,
-        "Origin": "https://as.its-kenpo.or.jp",
-        "Accept": "*/*",
-    },
-        timeout=TIMEOUT
+        headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-Token": csrf_token,
+            "Referer": response.url,
+            "Origin": BASE_URL,
+            "Accept": "*/*",
+        },
+        timeout=TIMEOUT,
     )
     search_response.raise_for_status()
-    print("=== POST送信内容の追加診断 ===")
-
-    print("送信URL:", search_response.request.url)
-    print("送信メソッド:", search_response.request.method)
-    
-    print("送信データ:")
-    sent_body = search_response.request.body
-    
-    if isinstance(sent_body, bytes):
-        sent_body = sent_body.decode("utf-8", errors="replace")
-    
-    from urllib.parse import parse_qs
-    
-    sent_params = parse_qs(sent_body or "", keep_blank_values=True)
-    
-    for key, value in sent_params.items():
-        if key == "authenticity_token":
-            print(f"{key}: (設定あり)")
-        else:
-            print(f"{key}: {value}")
-    
-    print("Cookie名:", list(session.cookies.keys()))
-    print("レスポンス本文:", search_response.text[:500])
-    print("=== 診断ここまで ===")
-    print("=== POSTリクエストヘッダー診断 ===")
-
-    request_headers = search_response.request.headers
-    
-    for name in (
-        "Referer",
-        "Origin",
-        "X-Requested-With",
-        "Accept",
-        "Content-Type",
-    ):
-        print(f"{name}: {request_headers.get(name, '(なし)')}")
-    
-    print("=== リダイレクト診断 ===")
-    print("HTTP履歴:", [
-        (r.status_code, r.url.split("?")[0])
-        for r in search_response.history
-    ])
-    print("最終ステータス:", search_response.status_code)
-    print("最終Content-Type:", search_response.headers.get("Content-Type"))
-    print("=== 診断ここまで ===")
-
-    print("=== POSTリダイレクト診断 ===")
-    print("POST redirect history:", [
-        (r.status_code, r.url.split("?")[0])
-        for r in search_response.history
-    ])
-    print("Final response URL:", search_response.url)
-    print("=== 診断ここまで ===")
-
-    results = BeautifulSoup(search_response.text, "lxml")
-    print("=== 空室検索レスポンス診断 ===")
-    print("HTTP status:", search_response.status_code)
-    print("Content-Type:", search_response.headers.get("Content-Type"))
-    print("Response URL:", search_response.url.split("?")[0])
-    print("Response prefix:", search_response.text[:300])
-    print("=== 診断ここまで ===")
-
     html_match = re.search(
         r"""\$\('#coma'\)\.html\(""",
         search_response.text
@@ -337,43 +228,8 @@ def main():
         "#coma_search_result input[type='checkbox'][name^='apply[coma[']"
     )
 
-    print("Checkbox count:", len(checkboxes))
-    print("Checkbox names:", [
-        item.get("name") for item in checkboxes
-    ][:20])
-
     if not checkboxes:
         fail("空室検索結果にチェックボックスがありません")
-
-    rows = []
-    for checkbox in checkboxes:
-        row = checkbox.find_parent("tr")
-        cells = [
-            cell.get_text(" ", strip=True)
-            for cell in row.select("td")
-        ] if row else []
-
-        if len(cells) < 6:
-            continue
-
-        room_no = int(cells[1]) if cells[1].isdigit() else None
-        capacity = re.search(r"(\d+)\s*[～〜~]\s*(\d+)", cells[4])
-
-        if cells[5] != "空き" or not capacity or not room_no:
-            continue
-
-        low, high = map(int, capacity.groups())
-        wanted = room_persons[0]
-
-        if len(room_persons) == 1 and low <= wanted <= high:
-            rows.append((room_no, checkbox.get("name"), checkbox.get("value"), cells))
-
-    if args.room_number is not None:
-        rows = [item for item in rows if item[0] == args.room_number]
-
-    if not rows:
-        fail("希望人数に合う空室が見つかりません")
-
 
     rows = []
     for checkbox in checkboxes:
@@ -408,13 +264,31 @@ def main():
     # Only 1 room is advanced automatically until multi-room result semantics are confirmed.
     if args.rooms != 1:
         fail("現在の実装は1室の選択までです。複数室では部屋割りと連泊の対応を追加してください")
+    for key in list(form_data):
+        if key.startswith("apply[coma["):
+            del form_data[key]
     form_data[chosen[1]] = chosen[2]
     session_guid = results.select_one("input[name='apply_session_guid']")
     if not session_guid:
         fail("検索結果の一時セッション情報が見つかりません")
     form_data[session_guid["name"]] = session_guid.get("value", "")
 
-    create_url = urljoin(response.url, form.get("action", ""))
+    create_url = booking_url(response.url, form.get("action", ""))
+    sha = ledger.write("pending") if ledger else None
+    try:
+        request_confirmation_email(session, create_url, form_data, args.email)
+        if ledger:
+            ledger.write("email_sent", sha)
+    except Exception as error:
+        raise RuntimeError(
+            f"部屋選択以降の結果を確定できません ({type(error).__name__})。"
+            "再実行する前に確認メールと申込状況を確認してください。"
+        ) from None
+    print(f"部屋番号 {chosen[0]} の確認メール送信完了画面を確認しました。")
+    print("確認メール内のURLを開いて申込を完了してください。")
+
+
+def request_confirmation_email(session, create_url, form_data, email):
     final = session.post(create_url, data=form_data, timeout=TIMEOUT, allow_redirects=True)
     final.raise_for_status()
     final_page = BeautifulSoup(final.text, "lxml")
@@ -427,19 +301,16 @@ def main():
     if "/apply/email_input" not in final.url and not final_page.select_one("input[name='email']"):
         fail("同意後のメール入力画面を確認できませんでした")
 
-    sent = submit_email(session, final_page, final.url, args.email)
-    sent_page = BeautifulSoup(sent.text, "lxml")
-    sent_text = sent_page.get_text(" ", strip=True)
-    if "確認メール" in sent_text or "メールを送信" in sent_text or "/apply/send_complete" in sent.url:
-        print(f"部屋番号 {chosen[0]} を選択し、確認メールを {args.email} に送信しました。")
-        print("確認メール内のURLを開いて申込を完了してください。そこから先は自動操作しません。")
-        return
-    fail("確認メール送信後の画面を確認できませんでした")
+    sent = submit_email(session, final_page, final.url, email)
+    sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
+    if sent_path != "/apply/send_complete":
+        fail("確認メール送信後の完了画面を確認できませんでした")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        detail = "通信またはHTTPエラー" if isinstance(error, requests.RequestException) else str(error)
+        print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr)
         sys.exit(1)

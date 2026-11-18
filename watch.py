@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import calendar
 import threading
 import time
@@ -17,6 +18,7 @@ from requests.adapters import HTTPAdapter
 from lxml import html as lxml_html
 
 STATE_PATH = Path("state.json")
+AUTO_BOOKING_SECTION = "## 自動申込チェックリスト"
 JST = ZoneInfo("Asia/Tokyo")
 
 MAX_WORKERS = 17
@@ -179,6 +181,8 @@ def load_highlighted_ids(targets):
     for line_number, line in enumerate(lines, start=1):
         stripped = line.strip()
 
+        if stripped == AUTO_BOOKING_SECTION:
+            break
         if not stripped.startswith("- ["):
             continue
 
@@ -214,6 +218,60 @@ def load_highlighted_ids(targets):
             highlighted_ids[target_id] = weekdays
 
     return highlighted_ids
+
+
+def load_auto_bookings(targets):
+    valid_ids = {str(target["id"]) for target in targets}
+    lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
+    sections = [i for i, line in enumerate(lines) if line.strip() == AUTO_BOOKING_SECTION]
+    if not sections:
+        return {}
+    if len(sections) > 1:
+        raise ValueError("自動申込チェックリストの見出しが重複しています")
+
+    bookings = {}
+    for line_number, line in enumerate(lines[sections[0] + 1:], sections[0] + 2):
+        line = line.strip()
+        if line.startswith("#"):
+            break
+        if not line.startswith("- ["):
+            continue
+        pattern = r"-\s+\[([ xX])\]\s+([A-Za-z0-9_-]+)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})"
+        match = re.fullmatch(pattern, line)
+        if not match:
+            raise ValueError(f"highlight.md {line_number}行目の自動申込欄の書式が正しくありません")
+        checked, facility_id, day = match.groups()
+        stay_date = date.fromisoformat(day)
+        if checked.lower() != "x":
+            continue
+        if facility_id not in valid_ids:
+            raise ValueError(f"highlight.md {line_number}行目の自動申込施設IDが targets.json にありません")
+        bookings.setdefault(facility_id, set()).add(stay_date)
+    return bookings
+
+
+def run_auto_bookings(bookings, results, today):
+    success = True
+    for result in results:
+        facility_id = result["target_id"]
+        for stay_date in sorted(bookings.get(facility_id, ())):
+            day = stay_date.isoformat()
+            status = result["months"].get(day[:7], {}).get(day)
+            if stay_date < today or status not in ("○", "△"):
+                continue
+
+            print(f"自動申込確認: {facility_id} {day}", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name("apply_booking.py")),
+                     "--facility-id", facility_id, "--date", day, "--nights", "1",
+                     "--persons", "2", "--rooms", "1", "--room-persons", "2"],
+                    check=True, timeout=150,
+                )
+            except (subprocess.SubprocessError, OSError) as error:
+                print(f"自動申込を確認できませんでした: {facility_id} {day} ({type(error).__name__})")
+                success = False
+    return success
 
 
 def is_highlighted_entry(entry, highlighted_ids):
@@ -707,6 +765,16 @@ def main():
 
     targets = load_targets()
     highlighted_ids = load_highlighted_ids(targets)
+    auto_bookings = {}
+    auto_ok = True
+    if os.environ.get("AUTO_BOOKING_ENABLED") == "true":
+        try:
+            if os.environ.get("GITHUB_ACTIONS") != "true":
+                raise RuntimeError("自動申込は GitHub Actions から実行してください")
+            auto_bookings = load_auto_bookings(targets)
+        except (ValueError, RuntimeError) as error:
+            print(f"自動申込設定エラー: {error}")
+            auto_ok = False
 
     print(
         f"監視対象: {len(targets)}施設、"
@@ -748,11 +816,14 @@ def main():
         if not (
             is_release_day
             and str(target["id"]) in release_done
+            and str(target["id"]) not in auto_bookings
         )
     ]
 
     if not scan_targets:
         print("27日の対象施設はすべて処理済みです。")
+        if not auto_ok:
+            sys.exit(1)
         return
 
     months_to_scan = target_months(today)
@@ -769,6 +840,8 @@ def main():
             )
 
             previous_months = old_entry.get("months", {})
+            if target_id in release_done:
+                previous_months = {}
 
             future = executor.submit(
                 scan_target,
@@ -808,6 +881,8 @@ def main():
         target_id = result["target_id"]
         current_months = result["months"]
         entries = result["entries"]
+        if is_release_day and target_id in release_done:
+            continue
 
         old_entry = state.setdefault(
             target_id,
@@ -1016,7 +1091,10 @@ def main():
     if notification_error:
         print("通知の一部または全部が未完了です。")
 
-    if failures or notification_error:
+    if auto_bookings:
+        auto_ok = run_auto_bookings(auto_bookings, successful_results, today)
+
+    if failures or notification_error or not auto_ok:
         sys.exit(1)
 
 
