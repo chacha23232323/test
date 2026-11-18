@@ -115,6 +115,15 @@ def main():
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
     response = session.get(apply_url, timeout=TIMEOUT)
     response.raise_for_status()
+    
+    print("=== GETリダイレクト診断 ===")
+    print("GET redirect history:", [
+        (r.status_code, r.url.split("?")[0])
+        for r in response.history
+    ])
+    print("GET final URL:", response.url)
+    print("=== 診断ここまで ===")
+    
     page = BeautifulSoup(response.text, "lxml")
     form = page.select_one("form#new_apply")
     if not form:
@@ -152,6 +161,11 @@ def main():
 
     search_button = page.select_one("input[value='空き検索'][onclick]")
     token_match = re.search(r"coma_search\(['\"]([^'\"]+)", search_button.get("onclick", "")) if search_button else None
+    print("=== 空き検索ボタン診断 ===")
+    print("Button onclick:", search_button.get("onclick") if search_button else "(なし)")
+    print("Extracted token:", token_match.group(1) if token_match else "(なし)")
+    print("Form action:", form.get("action"))
+    print("=== 診断ここまで ===")
     if not token_match:
         fail("空き検索用のページ情報を特定できません")
     search_url = urljoin(response.url, "empty_new?s=" + token_match.group(1))
