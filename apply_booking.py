@@ -399,7 +399,7 @@ def main():
     chosen = sorted(
         rows,
         key=lambda item: (
-            -int(re.search(r"(\d+)\s*[～〜~]", item[3][4]).group(2)),
+            -int(re.search(r"\d+\s*[～〜~]\s*(\d+)", item[3][4]).group(1)),
             item[0]
         )
     )[0]
