@@ -191,11 +191,6 @@ def main():
             fail("対象施設の name または booking_name が設定されていません")
         if (args.nights, args.persons, args.rooms, room_persons) != (1, 2, 1, [2]):
             fail("Gmailによる自動確定は1泊・2名・1室のみ対応します")
-        try:
-            oauth, profile = config_from_env()
-            headers = gmail_headers(oauth, args.email)
-        except Exception as error:
-            raise RuntimeError(f"Gmailまたは代表者設定の事前確認に失敗しました ({type(error).__name__})") from None
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
@@ -324,6 +319,16 @@ def main():
     if not finish_enabled:
         print("確認メール内のURLを開いて申込を完了してください。")
         return
+
+    try:
+        oauth, profile = config_from_env()
+        headers = gmail_headers(oauth, args.email)
+    except Exception as error:
+        raise RuntimeError(
+            f"案内メールの送信完了画面は確認済みです。"
+            f"Gmail認証または代表者設定を確認できません ({type(error).__name__})。"
+            "届いた案内メールから手動で進めてください。"
+        ) from None
 
     def mark_finalizing():
         nonlocal sha
