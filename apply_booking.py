@@ -281,19 +281,69 @@ def main():
     print("HTTP status:", search_response.status_code)
     print("Content-Type:", search_response.headers.get("Content-Type"))
     print("Response URL:", search_response.url.split("?")[0])
-    print("HTML title:", results.title.get_text(strip=True) if results.title else "(なし)")
-    print("Response text:", results.get_text(" ", strip=True)[:1500])
-    print("Checkbox count:", len(results.select("input[type='checkbox']")))
-    print("Checkbox names:", [
-        item.get("name") for item in results.select("input[type='checkbox']")
-    ][:20])
+    print("Response prefix:", search_response.text[:300])
     print("=== 診断ここまで ===")
-    checkboxes = results.select("#coma_search_result input[type='checkbox'][name^='apply[coma[' ]")
+
+    html_match = re.search(
+        r"""\$\('#coma'\)\.html\(""",
+        search_response.text
+    )
+
+    if not html_match:
+        fail("空室一覧を含むJavaScriptレスポンスが見つかりません")
+
+    js_literal = search_response.text[html_match.end():].lstrip()
+    js_literal = js_literal.replace(r"\$", "$")
+    js_literal = js_literal.replace(r"\'", "'")
+
+    try:
+        html_fragment, _ = json.JSONDecoder().raw_decode(js_literal)
+    except json.JSONDecodeError as error:
+        fail(f"検索結果のHTMLを取り出せません: {error}")
+
+    results = BeautifulSoup(html_fragment, "lxml")
+
+    checkboxes = results.select(
+        "#coma_search_result input[type='checkbox'][name^='apply[coma[']"
+    )
+
+    print("Checkbox count:", len(checkboxes))
+    print("Checkbox names:", [
+        item.get("name") for item in checkboxes
+    ][:20])
+
     if not checkboxes:
-        # The server can return a full page or an AJAX fragment depending on session state.
-        checkboxes = results.select("input[type='checkbox'][name^='apply[coma[' ]")
-    if not checkboxes:
-        fail("空室検索結果がありません。日付、人数、施設の状態を確認してください")
+        fail("空室検索結果にチェックボックスがありません")
+
+    rows = []
+    for checkbox in checkboxes:
+        row = checkbox.find_parent("tr")
+        cells = [
+            cell.get_text(" ", strip=True)
+            for cell in row.select("td")
+        ] if row else []
+
+        if len(cells) < 6:
+            continue
+
+        room_no = int(cells[1]) if cells[1].isdigit() else None
+        capacity = re.search(r"(\d+)\s*[～〜~]\s*(\d+)", cells[4])
+
+        if cells[5] != "空き" or not capacity or not room_no:
+            continue
+
+        low, high = map(int, capacity.groups())
+        wanted = room_persons[0]
+
+        if len(room_persons) == 1 and low <= wanted <= high:
+            rows.append((room_no, checkbox.get("name"), checkbox.get("value"), cells))
+
+    if args.room_number is not None:
+        rows = [item for item in rows if item[0] == args.room_number]
+
+    if not rows:
+        fail("希望人数に合う空室が見つかりません")
+
 
     rows = []
     for checkbox in checkboxes:
