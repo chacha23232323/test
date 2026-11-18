@@ -225,7 +225,12 @@ def main():
     search_response = session.post(
         search_url,
         data=form_data,
-        headers={"X-Requested-With": "XMLHttpRequest"},
+    headers={
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": response.url,
+        "Origin": "https://as.its-kenpo.or.jp",
+        "Accept": "*/*",
+    },
         timeout=TIMEOUT
     )
     search_response.raise_for_status()
