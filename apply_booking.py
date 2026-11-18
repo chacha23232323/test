@@ -176,6 +176,11 @@ def main():
     
     print("=== 診断ここまで ===")
     form = page.select_one("form#new_apply")
+    csrf_meta = page.select_one('meta[name="csrf-token"]')
+    csrf_token = csrf_meta.get("content") if csrf_meta else ""
+    
+    if not csrf_token:
+        raise RuntimeError("CSRF tokenが取得できません")
     if not form:
         fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
 
@@ -239,6 +244,7 @@ def main():
         data=form_data,
     headers={
         "X-Requested-With": "XMLHttpRequest",
+        "X-CSRF-Token": csrf_token,
         "Referer": response.url,
         "Origin": "https://as.its-kenpo.or.jp",
         "Accept": "*/*",
