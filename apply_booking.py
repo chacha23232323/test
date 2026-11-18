@@ -229,6 +229,27 @@ def main():
         timeout=TIMEOUT
     )
     search_response.raise_for_status()
+    print("=== POSTリクエストヘッダー診断 ===")
+
+    request_headers = search_response.request.headers
+    
+    for name in (
+        "Referer",
+        "Origin",
+        "X-Requested-With",
+        "Accept",
+        "Content-Type",
+    ):
+        print(f"{name}: {request_headers.get(name, '(なし)')}")
+    
+    print("=== リダイレクト診断 ===")
+    print("HTTP履歴:", [
+        (r.status_code, r.url.split("?")[0])
+        for r in search_response.history
+    ])
+    print("最終ステータス:", search_response.status_code)
+    print("最終Content-Type:", search_response.headers.get("Content-Type"))
+    print("=== 診断ここまで ===")
 
     print("=== POSTリダイレクト診断 ===")
     print("POST redirect history:", [
