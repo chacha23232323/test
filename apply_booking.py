@@ -139,6 +139,18 @@ def main():
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
     response = session.get(apply_url, timeout=TIMEOUT)
     response.raise_for_status()
+    print("=== GETリダイレクト詳細 ===")
+
+    for i, item in enumerate(response.history):
+        print(f"Redirect {i + 1}")
+        print("Status:", item.status_code)
+        print("From:", item.url)
+        print("Location:", item.headers.get("Location"))
+    
+    print("Final status:", response.status_code)
+    print("Final URL:", response.url)
+    
+    print("=== 診断ここまで ===")
     
     print("=== GETリダイレクト診断 ===")
     print("GET redirect history:", [
