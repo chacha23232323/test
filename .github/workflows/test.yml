@@ -3,21 +3,29 @@ name: test
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '7,37 * * * *'
 
 permissions:
   contents: write
 
 concurrency:
-  group: test
+  group: its-kenpo-main
   cancel-in-progress: false
 
 jobs:
   test:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.AUTO_BOOKING_ENABLED == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -37,14 +45,19 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt
 
-      - name: Check availability and notify
+      - name: Check availability, notify and apply if enabled
+        id: watch
         env:
+          BOOKING_BRANCH: main
+          BOOKING_GITHUB_TOKEN: ${{ github.token }}
+          AUTO_BOOKING_ENABLED: ${{ vars.AUTO_BOOKING_ENABLED }}
+          BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           COMMON_CALENDAR_URL: ${{ secrets.COMMON_CALENDAR_URL }}
         run: python watch.py
 
       - name: Persist state
-        if: always()
+        if: always() && steps.watch.outcome != 'skipped'
         run: |
           if [ -f state.json ]; then
             git config user.name "github-actions[bot]"
@@ -55,6 +68,6 @@ jobs:
             if ! git diff --cached --quiet; then
               git commit -m "Update test state"
               git pull --rebase origin main
-              git push
+              git push origin HEAD:main
             fi
           fi
