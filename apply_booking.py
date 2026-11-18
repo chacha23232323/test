@@ -369,6 +369,9 @@ def request_confirmation_email(session, create_url, form_data, email):
         final = booking_step("同意操作", submit_consent, session, final_page, final.url)
         final_page = BeautifulSoup(final.text, "lxml")
 
+    # The email page can contain nested form tags. Use browser HTML parsing
+    # so the hidden tokens and email field belong to the same form.
+    final_page = BeautifulSoup(final.text, "html5lib")
     if "/apply/email_input" not in final.url and not final_page.select_one("input[name='email']"):
         fail("同意後のメール入力画面を確認できませんでした")
 
