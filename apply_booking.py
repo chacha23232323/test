@@ -246,6 +246,30 @@ def main():
         timeout=TIMEOUT
     )
     search_response.raise_for_status()
+    print("=== POST送信内容の追加診断 ===")
+
+    print("送信URL:", search_response.request.url)
+    print("送信メソッド:", search_response.request.method)
+    
+    print("送信データ:")
+    sent_body = search_response.request.body
+    
+    if isinstance(sent_body, bytes):
+        sent_body = sent_body.decode("utf-8", errors="replace")
+    
+    from urllib.parse import parse_qs
+    
+    sent_params = parse_qs(sent_body or "", keep_blank_values=True)
+    
+    for key, value in sent_params.items():
+        if key == "authenticity_token":
+            print(f"{key}: (設定あり)")
+        else:
+            print(f"{key}: {value}")
+    
+    print("Cookie名:", list(session.cookies.keys()))
+    print("レスポンス本文:", search_response.text[:500])
+    print("=== 診断ここまで ===")
     print("=== POSTリクエストヘッダー診断 ===")
 
     request_headers = search_response.request.headers
