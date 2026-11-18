@@ -135,9 +135,16 @@ def submit_email(session, page, current_url, email):
     action = booking_url(current_url, form.get("action", current_url))
     values = form_values(form)
     values[field["name"]] = email
-    submit = form.select_one("input[type='submit'][name],button[type='submit'][name]")
+    submit = form.select_one(
+        "input[type='submit'][name]:not([disabled]), "
+        "button[type='submit'][name]:not([disabled]), "
+        "button:not([type])[name]:not([disabled])"
+    )
     if submit:
         values[submit["name"]] = submit.get("value", submit.get_text(" ", strip=True))
+    missing = [key for key in ("authenticity_token", "__token__", "commit") if not values.get(key)]
+    if missing:
+        fail(f"メールフォームの送信項目が不足しています: {', '.join(missing)}")
     response = session.post(action, data=values, timeout=TIMEOUT, allow_redirects=True)
     response.raise_for_status()
     return response
@@ -369,8 +376,16 @@ def request_confirmation_email(session, create_url, form_data, email):
     print("メール入力画面を確認しました", flush=True)
     sent = booking_step("メール送信", submit_email, session, final_page, final.url, email)
     sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
-    if sent_path != "/apply/send_complete":
-        fail("確認メール送信後の完了画面を確認できませんでした")
+    response_page = BeautifulSoup(sent.text, "lxml")
+    result = response_page.select_one("section.request-box")
+    result_text = re.sub(r"\s+", "", result.get_text()) if result else ""
+    if "メール送信を完了しました。" not in result_text:
+        if any("セッションがタイムアウトしました" in notice.get_text(" ", strip=True)
+               for notice in response_page.select("#flash_error_messages .notice")):
+            fail("メール送信後、ITS健保がセッションのタイムアウトを表示しました")
+        # Only log simple route names, excluding query strings and opaque path segments.
+        route = sent_path if re.fullmatch(r"/apply/[a-z_]{1,32}", sent_path) else "想定外のパス"
+        fail(f"確認メール送信後の完了画面を確認できませんでした (HTTP {sent.status_code}, 遷移先: {route})")
     return since_ms
 
 
