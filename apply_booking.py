@@ -1,4 +1,4 @@
-"""Search an ITS Kenpo facility, hold a matching room, and request email verification."""
+"""Search availability and request email verification for an application."""
 
 import argparse
 import json
@@ -13,9 +13,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from booking_ledger import BookingLedger
-from finish_booking import config_from_env, final_submission, gmail_headers
+from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
-BASE_URL = "https://as.its-kenpo.or.jp"
 TIMEOUT = (10, 30)
 
 
@@ -49,7 +48,10 @@ def get_apply_target(facility_id):
             apply_url = target.get("access_url", "").strip()
             if not apply_url:
                 fail(f"{facility_id} に access_url がありません")
-            if not apply_url.startswith("https://as.its-kenpo.or.jp/apply/empty_new?"):
+            parsed = urlsplit(apply_url)
+            if (
+                parsed.scheme, parsed.netloc, parsed.path, bool(parsed.query)
+            ) != ("https", urlsplit(booking_origin()).netloc, "/apply/empty_new", True):
                 fail(f"{facility_id} の access_url が申込ページ形式ではありません")
             return target, apply_url
     fail(f"targets.json に施設ID {facility_id} がありません")
@@ -93,8 +95,8 @@ def form_values(form):
 def booking_url(current_url, destination):
     url = urljoin(current_url, destination)
     parsed = urlsplit(url)
-    if (parsed.scheme, parsed.netloc) != ("https", urlsplit(BASE_URL).netloc):
-        fail("ITS健保以外の申込先が指定されました")
+    if (parsed.scheme, parsed.netloc) != ("https", urlsplit(booking_origin()).netloc):
+        fail("設定と異なる申込先が指定されました")
     return url
 
 
@@ -230,7 +232,7 @@ def main():
             "X-Requested-With": "XMLHttpRequest",
             "X-CSRF-Token": csrf_token,
             "Referer": response.url,
-            "Origin": BASE_URL,
+            "Origin": booking_origin(),
             "Accept": "*/*",
         },
         timeout=TIMEOUT,
@@ -349,13 +351,17 @@ def main():
 
 def publish_confirmed_reservation(facility_id, facility, stay_date, nights):
     secret = os.environ.get("RESERVATION_SYNC_SECRET", "").strip()
-    if not secret:
-        print("::warning::予約一覧との連携には RESERVATION_SYNC_SECRET の設定が必要です。")
+    endpoint = os.environ.get("RESERVATION_SYNC_URL", "").strip()
+    if not secret or not endpoint:
+        print("::warning::予約一覧との連携には RESERVATION_SYNC_SECRET と RESERVATION_SYNC_URL の設定が必要です。")
         return
 
     try:
+        parsed = urlsplit(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Invalid endpoint")
         response = requests.post(
-            "https://its-reservation-bot.bd0203d.workers.dev/api/confirmed-reservations",
+            endpoint,
             headers={"Authorization": f"Bearer {secret}"},
             json={"facility_id": facility_id, "facility": facility, "date": stay_date, "nights": nights},
             timeout=(5, 25), allow_redirects=False,
@@ -417,7 +423,7 @@ def request_confirmation_email(session, create_url, form_data, email):
     if "メール送信を完了しました。" not in result_text:
         if any("セッションがタイムアウトしました" in notice.get_text(" ", strip=True)
                for notice in response_page.select("#flash_error_messages .notice")):
-            fail("メール送信後、ITS健保がセッションのタイムアウトを表示しました")
+            fail("メール送信後、サイトがセッションのタイムアウトを表示しました")
         # Only log simple route names, excluding query strings and opaque path segments.
         route = sent_path if re.fullmatch(r"/apply/[a-z_]{1,32}", sent_path) else "想定外のパス"
         fail(f"確認メール送信後の完了画面を確認できませんでした (HTTP {sent.status_code}, 遷移先: {route})")

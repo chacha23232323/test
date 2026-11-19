@@ -1,4 +1,4 @@
-"""Read the current ITS message and submit the matching application."""
+"""Read the matching message and complete the application."""
 
 import base64
 import json
@@ -19,19 +19,29 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import requests
 from bs4 import BeautifulSoup
 
-HOST = "as.its-kenpo.or.jp"
-SENDER = "noreply@mail.its-kenpo.or.jp"
 SUBJECT_SUFFIX = "申込手続きのご案内"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 FIELDS = (
     "sign_no", "insured_no", "office_name", "kana_name", "year", "month", "day",
     "gender", "relationship", "contact_phone", "postal", "state", "address",
 )
-LINK_PATTERN = re.compile(
-    r"https://as\.its-kenpo\.or\.jp/apply/new\?c="
-    r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}(?![\w%&=#/?-])"
-)
 TIMEOUT = (5, 10)
+
+
+def booking_origin():
+    raw = os.environ.get("BOOKING_ORIGIN", "").strip()
+    parsed = urlsplit(raw)
+    if (parsed.scheme != "https" or not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.netloc)
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise RuntimeError("BOOKING_ORIGIN に有効な HTTPS オリジンを設定してください")
+    return f"https://{parsed.netloc.lower()}"
+
+
+def mail_sender():
+    sender = os.environ.get("BOOKING_MAIL_SENDER", "").strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+", sender):
+        raise RuntimeError("BOOKING_MAIL_SENDER を設定してください")
+    return sender
 
 
 def config_from_env():
@@ -73,22 +83,27 @@ def message_links(raw, facility):
     message = BytesParser(policy=policy.default).parsebytes(
         base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
     )
-    if parseaddr(str(message.get("From", "")))[1].lower() != SENDER:
+    if parseaddr(str(message.get("From", "")))[1].lower() != mail_sender():
         return set()
     if str(message.get("Subject", "")).strip() != facility + SUBJECT_SUFFIX:
         return set()
+    pattern = re.compile(
+        re.escape(booking_origin() + "/apply/new?c=")
+        + r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}(?![\w%&=#/?-])"
+    )
     links = set()
     for part in message.walk():
         if part.get_content_type() in ("text/plain", "text/html") and not part.is_attachment():
-            links.update(LINK_PATTERN.findall(part.get_content()))
+            links.update(pattern.findall(part.get_content()))
     return links
 
 
 def site_page(response, expected_path):
     parsed = urlsplit(response.url)
+    host = urlsplit(booking_origin()).netloc
     if response.status_code != 200 or (
         parsed.scheme, parsed.netloc, parsed.path
-    ) != ("https", HOST, expected_path):
+    ) != ("https", host, expected_path):
         stage = {
             "/apply/new": "案内リンクを開く",
             "/apply/confirm": "入力内容を送信して確認画面を取得",
@@ -97,10 +112,10 @@ def site_page(response, expected_path):
         known_paths = {"/", "/apply/new", "/apply/confirm", "/apply/complete",
                        "/apply/email_input", "/apply/send_complete", "/apply/rule",
                        "/service_category/index"}
-        destination = parsed.path if parsed.netloc == HOST and parsed.path in known_paths else "その他"
+        destination = parsed.path if parsed.netloc == host and parsed.path in known_paths else "その他"
         if 300 <= response.status_code < 400:
             location = urlsplit(urljoin(response.url, response.headers.get("Location", "")))
-            if location.netloc == HOST and location.path in known_paths:
+            if location.netloc == host and location.path in known_paths:
                 destination += f" → {location.path}"
         raise RuntimeError(f"{stage}: HTTP {response.status_code}、応答パス {destination}")
     page = BeautifulSoup(response.text, "lxml")
@@ -113,16 +128,17 @@ def site_page(response, expected_path):
 
 
 def form_at(page, current_url, path, correlation):
+    host = urlsplit(booking_origin()).netloc
     candidates = []
     for form in page.select("form[method][action]"):
         url = urljoin(current_url, form["action"])
         parsed = urlsplit(url)
         if form["method"].lower() == "post" and (
             parsed.scheme, parsed.netloc, parsed.path
-        ) == ("https", HOST, path):
+        ) == ("https", host, path):
             candidates.append((form, url))
     if len(candidates) != 1:
-        raise RuntimeError("ITS健保の送信フォームを特定できません")
+        raise RuntimeError("送信フォームを特定できません")
     form, url = candidates[0]
     query = parse_qs(urlsplit(url).query)
     if "c" in query and query["c"] != [correlation]:

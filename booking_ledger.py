@@ -42,7 +42,7 @@ class BookingLedger:
         record = dict(self.record, status=status)
         payload = {
             "branch": self.branch,
-            "message": f"Record ITS booking {status}",
+            "message": f"Update operation status {status}",
             "content": base64.b64encode(
                 (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode()
             ).decode("ascii"),
