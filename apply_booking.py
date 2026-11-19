@@ -344,6 +344,34 @@ def main():
         detail = str(error) if type(error) is RuntimeError else type(error).__name__
         raise RuntimeError(f"自動確定を確認できません: {detail}。Gmailと申込記録を確認してください。") from None
     print("申込完了画面と受付番号を確認しました。宿泊者の詳細登録は受付メールから行ってください。")
+    publish_confirmed_reservation(args.facility_id, booking_name, args.date, args.nights)
+
+
+def publish_confirmed_reservation(facility_id, facility, stay_date, nights):
+    secret = os.environ.get("RESERVATION_SYNC_SECRET", "").strip()
+    if not secret:
+        print("::warning::予約一覧との連携には RESERVATION_SYNC_SECRET の設定が必要です。")
+        return
+
+    try:
+        response = requests.post(
+            "https://its-reservation-bot.bd0203d.workers.dev/api/confirmed-reservations",
+            headers={"Authorization": f"Bearer {secret}"},
+            json={"facility_id": facility_id, "facility": facility, "date": stay_date, "nights": nights},
+            timeout=(5, 25), allow_redirects=False,
+        )
+        if response.status_code != 200:
+            status = f"HTTP {response.status_code}"
+            if response.status_code == 502:
+                status = "予約一覧に登録済み、Discord送信を確認できません"
+            print(f"::warning::申込は受付済みですが、予約管理の連携を確認できません ({status})")
+            return
+        if response.json().get("success") is True and response.json().get("notified") is True:
+            print("予約管理一覧への登録とDiscord通知を確認しました。")
+        else:
+            print("::warning::申込は受付済みですが、予約管理システムの応答を確認できません")
+    except (requests.RequestException, ValueError, AttributeError):
+        print("::warning::申込は受付済みですが、予約管理システムの応答を確認できません")
 
 
 def booking_failure_detail(error):
