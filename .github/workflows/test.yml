@@ -43,10 +43,6 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt
 
-      - name: Install Chromium
-        continue-on-error: true
-        run: python -m playwright install --with-deps chromium
-
       - name: Check availability, notify and apply if enabled
         id: watch
         env:
