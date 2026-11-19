@@ -164,7 +164,13 @@ def summary_mismatches(page, stay_date, facility):
         if name == "申込対象サービス":
             parts = list(value.stripped_strings)
             text = parts[-1] if parts else ""
-        values.setdefault(name, set()).add(compact(text))
+        text = compact(text)
+        if name == "希望日":
+            match = re.fullmatch(r"([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日より1泊", text)
+            if match:
+                year, month, day_number = map(int, match.groups())
+                text = f"{year}年{month}月{day_number}日より1泊"
+        values.setdefault(name, set()).add(text)
     return [name for name, expected_value in expected.items()
             if values.get(name, {"2"} if name == "第一部屋人数" else set()) != {expected_value}]
 
@@ -181,6 +187,7 @@ def find_application(session, headers, since_ms, stay_date, facility):
     listed_ids = set()
     fresh_count = 0
     link_count = 0
+    link_mismatches = set()
     while True:
         listing = json_response(requests.get(
             f"{GMAIL}/messages",
@@ -215,7 +222,10 @@ def find_application(session, headers, since_ms, stay_date, facility):
                 response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
                 page = site_page(response, "/apply/new")
                 loaded_link = link
-                if matching_summary(page, stay_date, facility):
+                mismatches = summary_mismatches(page, stay_date, facility)
+                if mismatches:
+                    link_mismatches.update(mismatches)
+                else:
                     matches.add(link)
         if len(matches) == 1:
             link = next(iter(matches))
@@ -228,6 +238,9 @@ def find_application(session, headers, since_ms, stay_date, facility):
         if len(matches) > 1:
             raise RuntimeError("同じ宿泊日の申込リンクが複数あります")
         if time.monotonic() >= deadline:
+            if link_mismatches:
+                labels = "、".join(sorted(link_mismatches))
+                raise RuntimeError(f"案内リンクは取得しましたが、申込画面で次の項目を照合できません: {labels}")
             raise RuntimeError(
                 f"Gmailで今回の申込手続きメールを確認できません "
                 f"(API検索結果 {len(listed_ids)} 件、新着候補 {fresh_count} 件、"
