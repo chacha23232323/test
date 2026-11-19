@@ -134,12 +134,14 @@ def matching_summary(page, stay_date, facility):
 
 
 def find_application(session, headers, since_ms, stay_date, facility):
-    deadline = time.monotonic() + 50
+    deadline = time.monotonic() + 90
     seen = set()
+    fresh_count = 0
+    link_count = 0
     while True:
         listing = json_response(requests.get(
             f"{GMAIL}/messages",
-            params={"q": f'from:{SENDER} subject:"{SUBJECT_SUFFIX}" after:{since_ms // 1000}',
+            params={"q": f'from:{SENDER} after:{since_ms // 1000}',
                     "maxResults": 15},
             headers=headers, timeout=TIMEOUT, allow_redirects=False,
         ))
@@ -159,7 +161,10 @@ def find_application(session, headers, since_ms, stay_date, facility):
             ))
             if int(message["internalDate"]) < since_ms:
                 continue
-            for link in message_links(message["raw"], facility):
+            fresh_count += 1
+            links = message_links(message["raw"], facility)
+            link_count += len(links)
+            for link in links:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("申込リンクの照合時間を超えました")
                 response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
@@ -176,7 +181,10 @@ def find_application(session, headers, since_ms, stay_date, facility):
         if len(matches) > 1:
             raise RuntimeError("同じ宿泊日の申込リンクが複数あります")
         if time.monotonic() >= deadline:
-            raise RuntimeError("Gmailで今回の申込手続きメールを確認できません")
+            raise RuntimeError(
+                f"Gmailで今回の申込手続きメールを確認できません "
+                f"(新着候補 {fresh_count} 件、差出人・件名が一致した申込リンク {link_count} 件)"
+            )
         time.sleep(min(3, max(0, deadline - time.monotonic())))
 
 
