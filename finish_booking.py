@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
@@ -98,7 +99,13 @@ def site_page(response, expected_path):
             if location.netloc == HOST and location.path in known_paths:
                 destination += f" → {location.path}"
         raise RuntimeError(f"{stage}: HTTP {response.status_code}、応答パス {destination}")
-    return BeautifulSoup(response.text, "lxml")
+    page = BeautifulSoup(response.text, "lxml")
+    if page.select_one(
+        'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
+        'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
+    ) or "人間であることを確認" in page.get_text(" ", strip=True):
+        raise RuntimeError("本人確認画面が表示されました。案内メールから手動で進めてください")
+    return page
 
 
 def form_at(page, current_url, path, correlation):
@@ -216,80 +223,89 @@ def hidden_fields(form):
             for field in form.select("input[type=hidden][name]:not([disabled])")}
 
 
-def final_submission(session, headers, profile, since_ms, stay_date, facility, before_final):
-    response, page, correlation = find_application(session, headers, since_ms, stay_date, facility)
-    form, url = form_at(page, response.url, "/apply/confirm", correlation)
-    data = hidden_fields(form)
-    if not data.get("authenticity_token"):
+class BrowserReader:
+    def __init__(self, page):
+        self.page = page
+
+    def get(self, url, *, timeout, allow_redirects):
+        response = self.page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+        return browser_response(self.page, response)
+
+
+def browser_response(page, response):
+    return SimpleNamespace(
+        url=page.url,
+        status_code=response.status if response else 0,
+        headers=response.headers if response else {},
+        text=page.content(),
+    )
+
+
+def form_button(page, form, label):
+    action = json.dumps(form["action"], ensure_ascii=False)
+    button = page.locator(f'form[action={action}]').get_by_role("button", name=label, exact=True)
+    if button.count() != 1:
+        raise RuntimeError(f"申込画面の「{label}」ボタンを特定できません")
+    return button
+
+
+def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, before_final):
+    response, document, correlation = find_application(
+        BrowserReader(page), headers, since_ms, stay_date, facility
+    )
+    form, _ = form_at(document, response.url, "/apply/confirm", correlation)
+    if not hidden_fields(form).get("authenticity_token"):
         raise RuntimeError("入力画面の送信用情報がありません")
-    for field, value in profile.items():
+
+    action = json.dumps(form["action"], ensure_ascii=False)
+    live_form = page.locator(f'form[action={action}]')
+    for field in FIELDS:
+        value = profile[field]
         name = f"apply[{field}]"
         control = form.find(["input", "select"], attrs={"name": name, "disabled": False})
         if control is None:
             raise RuntimeError(f"申込画面の項目 {field} を確認できません")
+        locator = live_form.locator(f'[name="{name}"]')
         if control.name == "select":
-            options = [option for option in control.select("option[value]:not([disabled])")
-                       if value in (option["value"], option.get_text(strip=True))]
-            if not options or len({opt["value"] for opt in options}) != 1:
+            options = {option["value"] for option in control.select("option[value]:not([disabled])")
+                       if value in (option["value"], option.get_text(strip=True))}
+            if len(options) != 1:
                 raise RuntimeError(f"申込画面の選択肢 {field} が一致しません")
-            value = options[0]["value"]
-        data[name] = value
-    confirmed = session.post(
-        url, data=data, headers={"Origin": f"https://{HOST}", "Referer": response.url},
-        timeout=TIMEOUT, allow_redirects=False,
-    )
-    if 300 <= confirmed.status_code < 400:
-        sent_cookie = confirmed.request.headers.get("Cookie", "")
-        sent_sessions = [
-            value for name, _, value in (
-                entry.strip().partition("=") for entry in sent_cookie.split(";")
-            ) if name == "_src_session" and value
-        ]
-        issued_sessions = [cookie.value for cookie in response.cookies
-                           if cookie.name == "_src_session"]
-        session_status = "あり" if sent_sessions else "なし"
-        if not issued_sessions:
-            continuity = "GET応答で発行なし"
-        elif len(sent_sessions) == 1 and len(issued_sessions) == 1:
-            continuity = "GET発行値と一致" if sent_sessions == issued_sessions else "GET発行値と不一致"
-        elif not sent_sessions:
-            continuity = "GETで発行、POSTでは未送信"
+            locator.select_option(value=next(iter(options)))
         else:
-            continuity = "同名Cookieが複数"
-        print(f"確認POSTの _src_session Cookie: {session_status} ({continuity})", flush=True)
-        location = urlsplit(urljoin(confirmed.url, confirmed.headers.get("Location", "")))
-        if (location.scheme, location.netloc, location.path) == (
-            "https", HOST, "/service_category/index"
-        ):
-            # Read the site's error page without replaying the confirmation POST.
-            try:
-                landing = session.get(location.geturl(), timeout=TIMEOUT, allow_redirects=False)
-                if landing.status_code == 200:
-                    page = BeautifulSoup(landing.text, "lxml")
-                    notices = " ".join(node.get_text(" ", strip=True)
-                                       for node in page.select("[id=flash_error_messages]"))
-                    if "セッションがタイムアウトしました" in notices:
-                        print("サイトの応答: セッションがタイムアウトしました", flush=True)
-                    elif notices.strip():
-                        print("サイトの応答: エラー表示あり（本文は非表示）", flush=True)
-                    else:
-                        print("サイトの応答: エラー表示なし", flush=True)
-            except requests.RequestException:
-                print("サイトのエラー画面を取得できませんでした", flush=True)
-    page = site_page(confirmed, "/apply/confirm")
-    if not matching_summary(page, stay_date, facility) or "申込内容確認画面" not in page.get_text(strip=True):
+            locator.fill(value)
+
+    button = form_button(page, form, "申込する")
+    with page.expect_navigation(wait_until="domcontentloaded") as navigated:
+        button.click()
+    confirmed = browser_response(page, navigated.value)
+    document = site_page(confirmed, "/apply/confirm")
+    if not matching_summary(document, stay_date, facility) or "申込内容確認画面" not in document.get_text(strip=True):
         raise RuntimeError("確認画面の施設・宿泊条件を確認できません")
-    form, url = form_at(page, confirmed.url, "/apply/complete", correlation)
+    form, _ = form_at(document, confirmed.url, "/apply/complete", correlation)
     data = hidden_fields(form)
     if data.get("c") != correlation or not data.get("authenticity_token"):
         raise RuntimeError("最終送信用の申込情報が一致しません")
+    button = form_button(page, form, "確認")
 
     before_final()
-    complete = session.post(
-        url, data={key: data[key] for key in ("c", "authenticity_token")},
-        timeout=TIMEOUT, allow_redirects=False,
-    )
-    page = site_page(complete, "/apply/complete")
-    content = page.get_text(" ", strip=True)
+    with page.expect_navigation(wait_until="domcontentloaded") as navigated:
+        button.click()
+    complete = browser_response(page, navigated.value)
+    document = site_page(complete, "/apply/complete")
+    content = document.get_text(" ", strip=True)
     if "申込を完了しました。" not in content or not re.search(r"申込受付番号\s*[:：]\s*\d+", content):
         raise RuntimeError("申込完了画面または受付番号を確認できません")
+
+
+def final_submission(headers, profile, since_ms, stay_date, facility, before_final):
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page(locale="ja-JP")
+            page.set_default_timeout(12_000)
+            submit_in_browser(page, headers, profile, since_ms, stay_date, facility, before_final)
+        finally:
+            browser.close()

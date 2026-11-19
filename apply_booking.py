@@ -335,10 +335,9 @@ def main():
         sha = ledger.write("finalizing", sha)
 
     try:
-        with requests.Session() as browser:
-            final_submission(
-                browser, headers, profile, since_ms, args.date, booking_name, mark_finalizing
-            )
+        final_submission(
+            headers, profile, since_ms, args.date, booking_name, mark_finalizing
+        )
         ledger.write("accepted", sha)
     except Exception as error:
         # HTTP exceptions can include the booking URL. Keep it out of Action logs.
