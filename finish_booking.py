@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -134,14 +134,17 @@ def matching_summary(page, stay_date, facility):
 
 
 def find_application(session, headers, since_ms, stay_date, facility):
-    deadline = time.monotonic() + 90
+    # Allow for clock differences and Gmail timestamps rounded to seconds.
+    first_second = since_ms // 1000 - 60
+    deadline = time.monotonic() + 30
     seen = set()
+    listed_ids = set()
     fresh_count = 0
     link_count = 0
     while True:
         listing = json_response(requests.get(
             f"{GMAIL}/messages",
-            params={"q": f'from:{SENDER} after:{since_ms // 1000}',
+            params={"q": f'after:{first_second - 1}',
                     "maxResults": 15},
             headers=headers, timeout=TIMEOUT, allow_redirects=False,
         ))
@@ -150,6 +153,7 @@ def find_application(session, headers, since_ms, stay_date, facility):
         matches = set()
         for item in listing.get("messages", []):
             message_id = item["id"]
+            listed_ids.add(message_id)
             if not re.fullmatch(r"[A-Za-z0-9_-]+", message_id) or message_id in seen:
                 continue
             if time.monotonic() >= deadline:
@@ -159,7 +163,7 @@ def find_application(session, headers, since_ms, stay_date, facility):
                 f"{GMAIL}/messages/{message_id}", params={"format": "raw"},
                 headers=headers, timeout=TIMEOUT, allow_redirects=False,
             ))
-            if int(message["internalDate"]) < since_ms:
+            if int(message["internalDate"]) // 1000 < first_second:
                 continue
             fresh_count += 1
             links = message_links(message["raw"], facility)
@@ -183,7 +187,10 @@ def find_application(session, headers, since_ms, stay_date, facility):
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"Gmailで今回の申込手続きメールを確認できません "
-                f"(新着候補 {fresh_count} 件、差出人・件名が一致した申込リンク {link_count} 件)"
+                f"(API検索結果 {len(listed_ids)} 件、新着候補 {fresh_count} 件、"
+                f"差出人・件名が一致した申込リンク {link_count} 件、"
+                f"送信開始 {datetime.fromtimestamp(since_ms / 1000, UTC).isoformat()}、"
+                f"検索終了 {datetime.now(UTC).isoformat()})"
             )
         time.sleep(min(3, max(0, deadline - time.monotonic())))
 
