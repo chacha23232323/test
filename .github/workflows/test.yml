@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: its-kenpo-main
+  group: operation-main
   cancel-in-progress: false
 
 jobs:
@@ -41,11 +41,14 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt
 
-      - name: Check availability, notify and apply if enabled
+      - name: Run configured checks
         id: watch
         env:
+          BOOKING_ORIGIN: ${{ secrets.BOOKING_ORIGIN }}
           BOOKING_BRANCH: main
           BOOKING_GITHUB_TOKEN: ${{ github.token }}
+          BOOKING_MAIL_SENDER: ${{ secrets.BOOKING_MAIL_SENDER }}
+          RESERVATION_SYNC_URL: ${{ secrets.RESERVATION_SYNC_URL }}
           BOOKING_GMAIL_OAUTH: ${{ secrets.BOOKING_GMAIL_OAUTH }}
           RESERVATION_SYNC_SECRET: ${{ secrets.RESERVATION_SYNC_SECRET }}
           BOOKING_APPLICANT: ${{ secrets.BOOKING_APPLICANT }}

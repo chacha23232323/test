@@ -33,7 +33,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: its-kenpo-main
+  group: operation-main
   cancel-in-progress: false
 
 jobs:
@@ -56,8 +56,9 @@ jobs:
           printf '%s' "$TARGETS_JSON" > targets.json
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-      - name: Search, hold one room, and send the confirmation email
+      - name: Run manual operation
         env:
+          BOOKING_ORIGIN: ${{ secrets.BOOKING_ORIGIN }}
           BOOKING_BRANCH: main
           BOOKING_GITHUB_TOKEN: ${{ github.token }}
           BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}
