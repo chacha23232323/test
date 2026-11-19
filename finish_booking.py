@@ -240,9 +240,23 @@ def final_submission(session, headers, profile, since_ms, stay_date, facility, b
     )
     if 300 <= confirmed.status_code < 400:
         sent_cookie = confirmed.request.headers.get("Cookie", "")
-        names = {entry.strip().partition("=")[0] for entry in sent_cookie.split(";")}
-        session_status = "あり" if "_src_session" in names else "なし"
-        print(f"確認POSTの _src_session Cookie: {session_status}", flush=True)
+        sent_sessions = [
+            value for name, _, value in (
+                entry.strip().partition("=") for entry in sent_cookie.split(";")
+            ) if name == "_src_session" and value
+        ]
+        issued_sessions = [cookie.value for cookie in response.cookies
+                           if cookie.name == "_src_session"]
+        session_status = "あり" if sent_sessions else "なし"
+        if not issued_sessions:
+            continuity = "GET応答で発行なし"
+        elif len(sent_sessions) == 1 and len(issued_sessions) == 1:
+            continuity = "GET発行値と一致" if sent_sessions == issued_sessions else "GET発行値と不一致"
+        elif not sent_sessions:
+            continuity = "GETで発行、POSTでは未送信"
+        else:
+            continuity = "同名Cookieが複数"
+        print(f"確認POSTの _src_session Cookie: {session_status} ({continuity})", flush=True)
         location = urlsplit(urljoin(confirmed.url, confirmed.headers.get("Location", "")))
         if (location.scheme, location.netloc, location.path) == (
             "https", HOST, "/service_category/index"
