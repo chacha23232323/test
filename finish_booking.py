@@ -243,6 +243,25 @@ def final_submission(session, headers, profile, since_ms, stay_date, facility, b
         names = {entry.strip().partition("=")[0] for entry in sent_cookie.split(";")}
         session_status = "あり" if "_src_session" in names else "なし"
         print(f"確認POSTの _src_session Cookie: {session_status}", flush=True)
+        location = urlsplit(urljoin(confirmed.url, confirmed.headers.get("Location", "")))
+        if (location.scheme, location.netloc, location.path) == (
+            "https", HOST, "/service_category/index"
+        ):
+            # Read the site's error page without replaying the confirmation POST.
+            try:
+                landing = session.get(location.geturl(), timeout=TIMEOUT, allow_redirects=False)
+                if landing.status_code == 200:
+                    page = BeautifulSoup(landing.text, "lxml")
+                    notices = " ".join(node.get_text(" ", strip=True)
+                                       for node in page.select("[id=flash_error_messages]"))
+                    if "セッションがタイムアウトしました" in notices:
+                        print("サイトの応答: セッションがタイムアウトしました", flush=True)
+                    elif notices.strip():
+                        print("サイトの応答: エラー表示あり（本文は非表示）", flush=True)
+                    else:
+                        print("サイトの応答: エラー表示なし", flush=True)
+            except requests.RequestException:
+                print("サイトのエラー画面を取得できませんでした", flush=True)
     page = site_page(confirmed, "/apply/confirm")
     if not matching_summary(page, stay_date, facility) or "申込内容確認画面" not in page.get_text(strip=True):
         raise RuntimeError("確認画面の施設・宿泊条件を確認できません")
