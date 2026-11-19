@@ -164,6 +164,7 @@ def find_application(session, headers, since_ms, stay_date, facility):
         if listing.get("nextPageToken"):
             raise RuntimeError("Gmail候補が多すぎて対象を特定できません")
         matches = set()
+        loaded_link = None
         for item in listing.get("messages", []):
             message_id = item["id"]
             listed_ids.add(message_id)
@@ -186,14 +187,16 @@ def find_application(session, headers, since_ms, stay_date, facility):
                     raise RuntimeError("申込リンクの照合時間を超えました")
                 response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
                 page = site_page(response, "/apply/new")
+                loaded_link = link
                 if matching_summary(page, stay_date, facility):
                     matches.add(link)
         if len(matches) == 1:
             link = next(iter(matches))
-            response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
-            page = site_page(response, "/apply/new")
-            if not matching_summary(page, stay_date, facility):
-                raise RuntimeError("再表示した入力画面の宿泊条件が一致しません")
+            if loaded_link != link:
+                response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
+                page = site_page(response, "/apply/new")
+                if not matching_summary(page, stay_date, facility):
+                    raise RuntimeError("再表示した入力画面の宿泊条件が一致しません")
             return response, page, parse_qs(urlsplit(link).query)["c"][0]
         if len(matches) > 1:
             raise RuntimeError("同じ宿泊日の申込リンクが複数あります")
@@ -231,7 +234,15 @@ def final_submission(session, headers, profile, since_ms, stay_date, facility, b
                 raise RuntimeError(f"申込画面の選択肢 {field} が一致しません")
             value = options[0]["value"]
         data[name] = value
-    confirmed = session.post(url, data=data, timeout=TIMEOUT, allow_redirects=False)
+    confirmed = session.post(
+        url, data=data, headers={"Origin": f"https://{HOST}", "Referer": response.url},
+        timeout=TIMEOUT, allow_redirects=False,
+    )
+    if 300 <= confirmed.status_code < 400:
+        sent_cookie = confirmed.request.headers.get("Cookie", "")
+        names = {entry.strip().partition("=")[0] for entry in sent_cookie.split(";")}
+        session_status = "あり" if "_src_session" in names else "なし"
+        print(f"確認POSTの _src_session Cookie: {session_status}", flush=True)
     page = site_page(confirmed, "/apply/confirm")
     if not matching_summary(page, stay_date, facility) or "申込内容確認画面" not in page.get_text(strip=True):
         raise RuntimeError("確認画面の施設・宿泊条件を確認できません")
