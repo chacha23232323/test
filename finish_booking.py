@@ -126,31 +126,47 @@ def form_at(page, current_url, path, correlation):
     return form, url
 
 
-def matching_summary(page, stay_date, facility):
-    summary = {}
-    service = ""
-    for row in page.select("dl"):
-        label = row.select_one("dt")
-        value = row.select_one("dd.elements")
-        if value is None:
-            entries = row.select("dd")
-            value = entries[-1] if entries else None
-        if label is not None and value is not None:
-            name = label.get_text(strip=True)
-            summary[name] = re.sub(r"\s+", "", value.get_text())
-            if name == "申込対象サービス":
-                parts = list(value.stripped_strings)
-                service = parts[-1] if parts else ""
+def summary_mismatches(page, stay_date, facility):
+    def compact(value):
+        return re.sub(r"\s+", "", value)
+
     day = date.fromisoformat(stay_date)
     expected = {
+        "申込対象サービス": compact(facility + "申込"),
         "希望日": f"{day.year}年{day.month}月{day.day}日より1泊",
-        "宿泊人数": "2", "希望部屋数": "1",
+        "宿泊人数": "2",
+        "希望部屋数": "1",
+        "第一部屋人数": "2",
     }
-    return (
-        re.sub(r"\s+", "", service) == re.sub(r"\s+", "", facility + "申込")
-        and all(summary.get(label) == value for label, value in expected.items())
-        and summary.get("第一部屋人数", "2") == "2"
-    )
+    values = {}
+    rows = []
+    for row in page.select("dl"):
+        label = row.select_one("dt")
+        entries = row.select("dd")
+        value = row.select_one("dd.elements")
+        if value is None and entries:
+            value = entries[-1]
+        if label is not None and value is not None:
+            rows.append((label, value))
+    for row in page.select("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        if len(cells) == 2:
+            rows.append(tuple(cells))
+    for label, value in rows:
+        name = compact(label.get_text(strip=True)).rstrip(":：")
+        if name not in expected:
+            continue
+        text = value.get_text()
+        if name == "申込対象サービス":
+            parts = list(value.stripped_strings)
+            text = parts[-1] if parts else ""
+        values.setdefault(name, set()).add(compact(text))
+    return [name for name, expected_value in expected.items()
+            if values.get(name, {"2"} if name == "第一部屋人数" else set()) != {expected_value}]
+
+
+def matching_summary(page, stay_date, facility):
+    return not summary_mismatches(page, stay_date, facility)
 
 
 def find_application(session, headers, since_ms, stay_date, facility):
@@ -280,8 +296,11 @@ def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, bef
         button.click()
     confirmed = browser_response(page, navigated.value)
     document = site_page(confirmed, "/apply/confirm")
-    if not matching_summary(document, stay_date, facility) or "申込内容確認画面" not in document.get_text(strip=True):
-        raise RuntimeError("確認画面の施設・宿泊条件を確認できません")
+    mismatches = summary_mismatches(document, stay_date, facility)
+    if "申込内容確認画面" not in re.sub(r"\s+", "", document.get_text()):
+        mismatches.insert(0, "画面見出し")
+    if mismatches:
+        raise RuntimeError(f"確認画面の施設・宿泊条件を確認できません: {', '.join(mismatches)}")
     form, _ = form_at(document, confirmed.url, "/apply/complete", correlation)
     data = hidden_fields(form)
     if data.get("c") != correlation or not data.get("authenticity_token"):
