@@ -312,7 +312,7 @@ def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, bef
         button.click()
     complete = browser_response(page, navigated.value)
     document = site_page(complete, "/apply/complete")
-    content = document.get_text(" ", strip=True)
+    content = re.sub(r"\s+", "", document.get_text())
     if "申込を完了しました。" not in content or not re.search(r"申込受付番号\s*[:：]\s*\d+", content):
         raise RuntimeError("申込完了画面または受付番号を確認できません")
 
