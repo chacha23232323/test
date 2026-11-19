@@ -4,11 +4,15 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from datetime import UTC, date, datetime
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -317,11 +321,30 @@ def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, bef
         raise RuntimeError("申込完了画面または受付番号を確認できません")
 
 
+def launch_booking_browser(playwright):
+    chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    if chrome:
+        print("インストール済みのChromeを使います", flush=True)
+        return playwright.chromium.launch(executable_path=chrome)
+
+    chromium = Path(playwright.chromium.executable_path)
+    if not chromium.is_file():
+        print("案内メール送信後にChromiumを準備します", flush=True)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True, timeout=90,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError("Chromiumを準備できませんでした。届いた案内メールを確認してください") from None
+    return playwright.chromium.launch(executable_path=str(chromium))
+
+
 def final_submission(headers, profile, since_ms, stay_date, facility, before_final):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
+        browser = launch_booking_browser(playwright)
         try:
             page = browser.new_page(locale="ja-JP")
             page.set_default_timeout(12_000)
