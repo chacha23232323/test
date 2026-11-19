@@ -84,7 +84,20 @@ def site_page(response, expected_path):
     if response.status_code != 200 or (
         parsed.scheme, parsed.netloc, parsed.path
     ) != ("https", HOST, expected_path):
-        raise RuntimeError("ITS健保の想定した画面を確認できません")
+        stage = {
+            "/apply/new": "案内リンクを開く",
+            "/apply/confirm": "入力内容を送信して確認画面を取得",
+            "/apply/complete": "最終送信後の完了画面を取得",
+        }[expected_path]
+        known_paths = {"/", "/apply/new", "/apply/confirm", "/apply/complete",
+                       "/apply/email_input", "/apply/send_complete", "/apply/rule",
+                       "/service_category/index"}
+        destination = parsed.path if parsed.netloc == HOST and parsed.path in known_paths else "その他"
+        if 300 <= response.status_code < 400:
+            location = urlsplit(urljoin(response.url, response.headers.get("Location", "")))
+            if location.netloc == HOST and location.path in known_paths:
+                destination += f" → {location.path}"
+        raise RuntimeError(f"{stage}: HTTP {response.status_code}、応答パス {destination}")
     return BeautifulSoup(response.text, "lxml")
 
 
