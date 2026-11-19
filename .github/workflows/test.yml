@@ -49,6 +49,7 @@ jobs:
           BOOKING_BRANCH: main
           BOOKING_GITHUB_TOKEN: ${{ github.token }}
           BOOKING_GMAIL_OAUTH: ${{ secrets.BOOKING_GMAIL_OAUTH }}
+          RESERVATION_SYNC_SECRET: ${{ secrets.RESERVATION_SYNC_SECRET }}
           BOOKING_APPLICANT: ${{ secrets.BOOKING_APPLICANT }}
           BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
