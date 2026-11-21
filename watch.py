@@ -1,20 +1,20 @@
-import calendar
 import json
 import os
 import re
-import subprocess
 import sys
+import subprocess
+import calendar
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from lxml import html as lxml_html
 from requests.adapters import HTTPAdapter
+from lxml import html as lxml_html
 
 STATE_PATH = Path("state.json")
 AUTO_BOOKING_SECTION = "## 自動申込チェックリスト"
@@ -74,7 +74,9 @@ def get_discord_session():
 
     if _discord_session is None:
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+        })
 
         adapter = HTTPAdapter(
             pool_connections=1,
@@ -90,7 +92,9 @@ def get_discord_session():
 
 
 def load_targets():
-    data = json.loads(Path("targets.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        Path("targets.json").read_text(encoding="utf-8")
+    )
     targets = data.get("targets", [])
 
     if not targets:
@@ -109,7 +113,10 @@ def load_targets():
 
 
 def parse_highlight_weekdays(label, line_number):
-    day_match = re.search(r"[（(]([^（）()]*)[）)]\s*$", label)
+    day_match = re.search(
+        r"[（(]([^（）()]*)[）)]\s*$",
+        label,
+    )
 
     if not day_match:
         return None
@@ -119,7 +126,11 @@ def parse_highlight_weekdays(label, line_number):
     if day_text == "全曜日":
         return None
 
-    normalized = re.sub(r"[・、,，\s]+", "", day_text)
+    normalized = re.sub(
+        r"[・、,，\s]+",
+        "",
+        day_text,
+    )
 
     if not normalized:
         raise RuntimeError(
@@ -194,10 +205,13 @@ def load_highlighted_ids(targets):
                 )
 
             label = match.group("label").strip()
-            highlighted_ids[target_id] = parse_highlight_weekdays(
+
+            weekdays = parse_highlight_weekdays(
                 label,
                 line_number,
             )
+
+            highlighted_ids[target_id] = weekdays
 
     return highlighted_ids
 
@@ -304,7 +318,10 @@ def is_highlighted_entry(entry, highlighted_ids):
     if weekdays is None:
         return True
 
-    entry_weekday = date.fromisoformat(entry["day"]).weekday()
+    entry_weekday = date.fromisoformat(
+        entry["day"]
+    ).weekday()
+
     return entry_weekday in weekdays
 
 
@@ -339,7 +356,10 @@ def target_months(today):
 
 
 def fetch_html(url):
-    with get_session().get(url, timeout=REQUEST_TIMEOUT) as response:
+    with get_session().get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
         response.raise_for_status()
         response.encoding = "utf-8"
         return response.text
@@ -392,7 +412,9 @@ def load_state():
         return {}
 
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(
+            STATE_PATH.read_text(encoding="utf-8")
+        )
     except json.JSONDecodeError:
         raise RuntimeError(
             "state.json が壊れています。安全のため停止します"
@@ -411,7 +433,9 @@ def save_state(state):
 
 
 def discord_webhook(messages):
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    webhook_url = os.environ.get(
+        "DISCORD_WEBHOOK_URL", ""
+    ).strip()
 
     if not webhook_url:
         raise RuntimeError("DISCORD_WEBHOOK_URL が未設定です")
@@ -425,9 +449,13 @@ def discord_webhook(messages):
             continue
 
         if len(embeds) > MAX_EMBEDS_PER_MESSAGE:
-            raise RuntimeError("DiscordのEmbed数上限を超えています")
+            raise RuntimeError(
+                "DiscordのEmbed数上限を超えています"
+            )
 
-        payload = {"embeds": embeds}
+        payload = {
+            "embeds": embeds
+        }
 
         for attempt in range(DISCORD_MAX_RETRIES + 1):
             try:
@@ -436,6 +464,7 @@ def discord_webhook(messages):
                     json=payload,
                     timeout=REQUEST_TIMEOUT,
                 ) as response:
+
                     if response.status_code == 429:
                         if attempt >= DISCORD_MAX_RETRIES:
                             raise RuntimeError(
@@ -446,26 +475,38 @@ def discord_webhook(messages):
                         retry_after = None
 
                         try:
-                            retry_after = float(response.json().get("retry_after"))
+                            retry_after = float(
+                                response.json().get("retry_after")
+                            )
                         except (ValueError, TypeError, AttributeError):
                             pass
 
                         if retry_after is None:
                             try:
                                 retry_after = float(
-                                    response.headers.get("Retry-After", "1")
+                                    response.headers.get(
+                                        "Retry-After",
+                                        "1",
+                                    )
                                 )
                             except (ValueError, TypeError):
                                 retry_after = 1.0
 
-                        time.sleep(max(0.0, min(retry_after, 60.0)))
+                        wait_time = max(
+                            0.0,
+                            min(retry_after, 60.0),
+                        )
+
+                        time.sleep(wait_time)
                         continue
 
                     if not 200 <= response.status_code < 300:
                         error_text = response.text[:500]
+
                         raise RuntimeError(
                             f"Discord送信に失敗しました "
-                            f"(HTTP {response.status_code}: {error_text})"
+                            f"(HTTP {response.status_code}: "
+                            f"{error_text})"
                         )
 
                     break
@@ -511,55 +552,56 @@ def build_notice_blocks(entries, max_block_chars=3800):
         target_id, facility_name, year, month = group_key
         tag = (target_id, f"{year:04d}-{month:02d}")
 
-        header = [
-            f'📍 {group["location"]}',
-            f"📅 {year}年{month}月",
-        ]
-
-        if group["trip_purpose"]:
-            header.append(f'🎯 {group["trip_purpose"]}')
-
-        if group["bike_trip"]:
-            header.append(f'🏍 足立発 {group["bike_trip"]}')
+        sorted_entries = sorted(group["entries"], key=lambda entry: entry["day"])
+        month_heading = []
+        if len(sorted_entries) > 1:
+            month_heading.append(f"> **📅 {year}年{month}月**")
 
         daily_lines = []
 
-        for entry in sorted(group["entries"], key=lambda entry: entry["day"]):
+        for entry in sorted_entries:
+            if month_heading:
+                day = date.fromisoformat(entry["day"])
+                date_label = f"{day.day}日（{WEEKDAYS_JA[day.weekday()]}）"
+            else:
+                date_label = f'📅 {format_japanese_date(entry["day"])}'
+
             daily_lines.append(
-                f'> **📅 {format_japanese_date(entry["day"])}**\n'
-                f'> **{entry["status"]}｜{entry["nights"]}泊**'
+                f'> **{date_label}｜{entry["status"]}｜{entry["nights"]}泊**'
             )
 
-        tail = [f'🔗 [申し込みする]({group["url"]})']
+        details = [f'📍 {group["location"]}']
+
+        if group["trip_purpose"]:
+            details.append(f'🎯 {group["trip_purpose"]}')
+
+        if group["bike_trip"]:
+            details.append(f'🏍 足立発 {group["bike_trip"]}')
+
+        tail = ["", f'🔗 [申し込みする]({group["url"]})', "", *details]
         current_lines = []
 
         for daily_line in daily_lines:
-            candidate = header + current_lines + [daily_line] + tail
+            if len("\n".join(month_heading + [daily_line] + tail)) > max_block_chars:
+                raise RuntimeError(f"{facility_name} の日付情報とURLが長すぎます")
 
-            if len("\n".join(candidate)) <= max_block_chars:
-                current_lines.append(daily_line)
-                continue
+            candidate = month_heading + current_lines + [daily_line] + tail
 
-            if not current_lines:
-                raise RuntimeError(f"{facility_name} の日付情報1件が長すぎます")
+            if len("\n".join(candidate)) > max_block_chars:
+                blocks.append({
+                    "text": "\n".join(month_heading + current_lines + tail),
+                    "tags": {tag},
+                    "facility_name": facility_name,
+                })
+                current_lines = []
 
-            blocks.append({
-                "text": "\n".join(header + current_lines + tail),
-                "tags": {tag},
-                "facility_name": facility_name,
-            })
+            current_lines.append(daily_line)
 
-            current_lines = [daily_line]
-
-        if len("\n".join(header + current_lines + tail)) > max_block_chars:
-            raise RuntimeError(f"{facility_name} の日付情報とURLが長すぎます")
-
-        if current_lines:
-            blocks.append({
-                "text": "\n".join(header + current_lines + tail),
-                "tags": {tag},
-                "facility_name": facility_name,
-            })
+        blocks.append({
+            "text": "\n".join(month_heading + current_lines + tail),
+            "tags": {tag},
+            "facility_name": facility_name,
+        })
 
     return blocks
 
@@ -575,10 +617,14 @@ def pack_notice_messages(blocks):
         description = block["text"]
 
         if len(title) > 256:
-            raise RuntimeError("Embedタイトルが長すぎます")
+            raise RuntimeError(
+                "Embedタイトルが長すぎます"
+            )
 
         if len(description) > 4096:
-            raise RuntimeError("Embed本文が長すぎます")
+            raise RuntimeError(
+                "Embed本文が長すぎます"
+            )
 
         embed = {
             "title": title,
@@ -628,9 +674,21 @@ def scan_target(target, months_to_scan, previous_months, is_baseline):
 
     for year, month in months_to_scan:
         month_key = f"{year:04d}-{month:02d}"
-        url = make_month_url(target["url"], year, month, base_date)
+
+        url = make_month_url(
+            target["url"],
+            year,
+            month,
+            base_date,
+        )
+
         html = fetch_html(url)
-        current = detect_daily_statuses(html, year, month)
+
+        current = detect_daily_statuses(
+            html,
+            year,
+            month,
+        )
 
         current_months[month_key] = current
         previous = previous_months.get(month_key, {})
