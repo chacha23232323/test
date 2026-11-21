@@ -1,21 +1,20 @@
-
+import calendar
 import json
 import os
 import re
-import sys
 import subprocess
-import calendar
+import sys
 import threading
 import time
-from pathlib import Path
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
-from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import requests
-from requests.adapters import HTTPAdapter
 from lxml import html as lxml_html
+from requests.adapters import HTTPAdapter
 
 STATE_PATH = Path("state.json")
 AUTO_BOOKING_SECTION = "## 自動申込チェックリスト"
@@ -30,9 +29,6 @@ DISCORD_MAX_RETRIES = 5
 
 COLOR_HIGHLIGHTED = 0xE74C3C
 COLOR_STANDARD = 0x3498DB
-COLOR_COMMON = 0x5865F2
-
-COMMON_CALENDAR_URL = os.environ.get("COMMON_CALENDAR_URL", "").strip()
 
 _thread_local = threading.local()
 _discord_session = None
@@ -78,9 +74,7 @@ def get_discord_session():
 
     if _discord_session is None:
         session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0",
-        })
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
 
         adapter = HTTPAdapter(
             pool_connections=1,
@@ -96,9 +90,7 @@ def get_discord_session():
 
 
 def load_targets():
-    data = json.loads(
-        Path("targets.json").read_text(encoding="utf-8")
-    )
+    data = json.loads(Path("targets.json").read_text(encoding="utf-8"))
     targets = data.get("targets", [])
 
     if not targets:
@@ -117,10 +109,7 @@ def load_targets():
 
 
 def parse_highlight_weekdays(label, line_number):
-    day_match = re.search(
-        r"[（(]([^（）()]*)[）)]\s*$",
-        label,
-    )
+    day_match = re.search(r"[（(]([^（）()]*)[）)]\s*$", label)
 
     if not day_match:
         return None
@@ -130,11 +119,7 @@ def parse_highlight_weekdays(label, line_number):
     if day_text == "全曜日":
         return None
 
-    normalized = re.sub(
-        r"[・、,，\s]+",
-        "",
-        day_text,
-    )
+    normalized = re.sub(r"[・、,，\s]+", "", day_text)
 
     if not normalized:
         raise RuntimeError(
@@ -209,13 +194,10 @@ def load_highlighted_ids(targets):
                 )
 
             label = match.group("label").strip()
-
-            weekdays = parse_highlight_weekdays(
+            highlighted_ids[target_id] = parse_highlight_weekdays(
                 label,
                 line_number,
             )
-
-            highlighted_ids[target_id] = weekdays
 
     return highlighted_ids
 
@@ -223,55 +205,91 @@ def load_highlighted_ids(targets):
 def load_auto_bookings(targets):
     valid_ids = {str(target["id"]) for target in targets}
     lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
-    sections = [i for i, line in enumerate(lines) if line.strip() == AUTO_BOOKING_SECTION]
+    sections = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == AUTO_BOOKING_SECTION
+    ]
+
     if not sections:
         return {}
+
     if len(sections) > 1:
         raise ValueError("自動申込チェックリストの見出しが重複しています")
 
+    pattern = re.compile(
+        r"-\s+\[([ xX])\]\s+([A-Za-z0-9_-]+)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})"
+    )
     bookings = {}
+
     for line_number, line in enumerate(lines[sections[0] + 1:], sections[0] + 2):
         line = line.strip()
+
         if line.startswith("#"):
             break
         if not line.startswith("- ["):
             continue
-        pattern = r"-\s+\[([ xX])\]\s+([A-Za-z0-9_-]+)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})"
-        match = re.fullmatch(pattern, line)
+
+        match = pattern.fullmatch(line)
         if not match:
-            raise ValueError(f"highlight.md {line_number}行目の自動申込欄の書式が正しくありません")
+            raise ValueError(
+                f"highlight.md {line_number}行目の自動申込欄の書式が正しくありません"
+            )
+
         checked, facility_id, day = match.groups()
         stay_date = date.fromisoformat(day)
+
         if checked.lower() != "x":
             continue
+
         if facility_id not in valid_ids:
-            raise ValueError(f"highlight.md {line_number}行目の自動申込施設IDが targets.json にありません")
+            raise ValueError(
+                f"highlight.md {line_number}行目の自動申込施設IDが targets.json にありません"
+            )
+
         bookings.setdefault(facility_id, set()).add(stay_date)
+
     return bookings
 
 
 def run_auto_bookings(bookings, results, today):
     success = True
+
     for result in results:
         facility_id = result["target_id"]
+
         for stay_date in sorted(bookings.get(facility_id, ())):
             day = stay_date.isoformat()
             status = result["months"].get(day[:7], {}).get(day)
+
             if stay_date < today or status not in ("○", "△"):
                 continue
 
             print(f"自動申込確認: {facility_id} {day}", flush=True)
+
             try:
                 subprocess.run(
-                    [sys.executable, str(Path(__file__).with_name("apply_booking.py")),
-                     "--facility-id", facility_id, "--date", day, "--nights", "1",
-                     "--persons", "2", "--rooms", "1", "--room-persons", "2",
-                     "--finish-from-gmail"],
-                    check=True, timeout=270,
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("apply_booking.py")),
+                        "--facility-id", facility_id,
+                        "--date", day,
+                        "--nights", "1",
+                        "--persons", "2",
+                        "--rooms", "1",
+                        "--room-persons", "2",
+                        "--finish-from-gmail",
+                    ],
+                    check=True,
+                    timeout=270,
                 )
             except (subprocess.SubprocessError, OSError) as error:
-                print(f"自動申込を確認できませんでした: {facility_id} {day} ({type(error).__name__})")
+                print(
+                    f"自動申込を確認できませんでした: "
+                    f"{facility_id} {day} ({type(error).__name__})"
+                )
                 success = False
+
     return success
 
 
@@ -286,10 +304,7 @@ def is_highlighted_entry(entry, highlighted_ids):
     if weekdays is None:
         return True
 
-    entry_weekday = date.fromisoformat(
-        entry["day"]
-    ).weekday()
-
+    entry_weekday = date.fromisoformat(entry["day"]).weekday()
     return entry_weekday in weekdays
 
 
@@ -324,10 +339,7 @@ def target_months(today):
 
 
 def fetch_html(url):
-    with get_session().get(
-        url,
-        timeout=REQUEST_TIMEOUT,
-    ) as response:
+    with get_session().get(url, timeout=REQUEST_TIMEOUT) as response:
         response.raise_for_status()
         response.encoding = "utf-8"
         return response.text
@@ -380,9 +392,7 @@ def load_state():
         return {}
 
     try:
-        return json.loads(
-            STATE_PATH.read_text(encoding="utf-8")
-        )
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         raise RuntimeError(
             "state.json が壊れています。安全のため停止します"
@@ -401,9 +411,7 @@ def save_state(state):
 
 
 def discord_webhook(messages):
-    webhook_url = os.environ.get(
-        "DISCORD_WEBHOOK_URL", ""
-    ).strip()
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
     if not webhook_url:
         raise RuntimeError("DISCORD_WEBHOOK_URL が未設定です")
@@ -417,13 +425,9 @@ def discord_webhook(messages):
             continue
 
         if len(embeds) > MAX_EMBEDS_PER_MESSAGE:
-            raise RuntimeError(
-                "DiscordのEmbed数上限を超えています"
-            )
+            raise RuntimeError("DiscordのEmbed数上限を超えています")
 
-        payload = {
-            "embeds": embeds
-        }
+        payload = {"embeds": embeds}
 
         for attempt in range(DISCORD_MAX_RETRIES + 1):
             try:
@@ -432,7 +436,6 @@ def discord_webhook(messages):
                     json=payload,
                     timeout=REQUEST_TIMEOUT,
                 ) as response:
-
                     if response.status_code == 429:
                         if attempt >= DISCORD_MAX_RETRIES:
                             raise RuntimeError(
@@ -443,38 +446,26 @@ def discord_webhook(messages):
                         retry_after = None
 
                         try:
-                            retry_after = float(
-                                response.json().get("retry_after")
-                            )
+                            retry_after = float(response.json().get("retry_after"))
                         except (ValueError, TypeError, AttributeError):
                             pass
 
                         if retry_after is None:
                             try:
                                 retry_after = float(
-                                    response.headers.get(
-                                        "Retry-After",
-                                        "1",
-                                    )
+                                    response.headers.get("Retry-After", "1")
                                 )
                             except (ValueError, TypeError):
                                 retry_after = 1.0
 
-                        wait_time = max(
-                            0.0,
-                            min(retry_after, 60.0),
-                        )
-
-                        time.sleep(wait_time)
+                        time.sleep(max(0.0, min(retry_after, 60.0)))
                         continue
 
                     if not 200 <= response.status_code < 300:
                         error_text = response.text[:500]
-
                         raise RuntimeError(
                             f"Discord送信に失敗しました "
-                            f"(HTTP {response.status_code}: "
-                            f"{error_text})"
+                            f"(HTTP {response.status_code}: {error_text})"
                         )
 
                     break
@@ -495,35 +486,18 @@ def format_japanese_date(day_text):
     )
 
 
-def build_notice_blocks(
-    entries,
-    include_facility_urls,
-    common_url=None,
-    max_block_chars=3800,
-):
+def build_notice_blocks(entries, max_block_chars=3800):
     grouped = {}
 
     for entry in entries:
         day = date.fromisoformat(entry["day"])
         target_id = str(entry["target_id"])
-
-        month_key = f"{day.year:04d}-{day.month:02d}"
-
-        group_key = (
-            target_id,
-            entry["name"],
-            day.year,
-            day.month,
-        )
+        group_key = (target_id, entry["name"], day.year, day.month)
 
         if group_key not in grouped:
             grouped[group_key] = {
-                "target_id": target_id,
-                "facility_name": entry["name"],
-                "month_key": month_key,
                 "location": entry["location"],
                 "url": entry["url"],
-                "nights": entry["nights"],
                 "trip_purpose": entry.get("trip_purpose", ""),
                 "bike_trip": entry.get("bike_trip", ""),
                 "entries": [],
@@ -532,108 +506,60 @@ def build_notice_blocks(
         grouped[group_key]["entries"].append(entry)
 
     blocks = []
-    all_tags = set()
 
     for group_key, group in sorted(grouped.items()):
-        target_id = group["target_id"]
-        month_key = group["month_key"]
-        tag = (target_id, month_key)
-
-        all_tags.add(tag)
-
-        year = group_key[2]
-        month = group_key[3]
+        target_id, facility_name, year, month = group_key
+        tag = (target_id, f"{year:04d}-{month:02d}")
 
         header = [
             f'📍 {group["location"]}',
-            f'📅 {year}年{month}月',
+            f"📅 {year}年{month}月",
         ]
 
         if group["trip_purpose"]:
-            header.append(
-                f'🎯 {group["trip_purpose"]}'
-            )
+            header.append(f'🎯 {group["trip_purpose"]}')
 
         if group["bike_trip"]:
-            header.append(
-                f'🏍 足立発 {group["bike_trip"]}'
-            )
+            header.append(f'🏍 足立発 {group["bike_trip"]}')
 
         daily_lines = []
 
-        for entry in sorted(
-            group["entries"],
-            key=lambda x: x["day"],
-        ):
+        for entry in sorted(group["entries"], key=lambda entry: entry["day"]):
             daily_lines.append(
                 f'> **📅 {format_japanese_date(entry["day"])}**\n'
                 f'> **{entry["status"]}｜{entry["nights"]}泊**'
             )
 
-        tail = []
-
-        if include_facility_urls:
-            tail = [
-                f'🔗 [申し込みする]({group["url"]})'
-            ]
-
+        tail = [f'🔗 [申し込みする]({group["url"]})']
         current_lines = []
 
         for daily_line in daily_lines:
-            candidate = (
-                header
-                + current_lines
-                + [daily_line]
-                + tail
-            )
+            candidate = header + current_lines + [daily_line] + tail
 
             if len("\n".join(candidate)) <= max_block_chars:
                 current_lines.append(daily_line)
                 continue
 
             if not current_lines:
-                raise RuntimeError(
-                    f"{group_key[1]} の日付情報1件が長すぎます"
-                )
+                raise RuntimeError(f"{facility_name} の日付情報1件が長すぎます")
 
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
-                "facility_name": group["facility_name"],
+                "facility_name": facility_name,
             })
 
             current_lines = [daily_line]
 
-        if len(
-            "\n".join(header + current_lines + tail)
-        ) > max_block_chars:
-            raise RuntimeError(
-                f"{group_key[1]} の日付情報とURLが長すぎます"
-            )
+        if len("\n".join(header + current_lines + tail)) > max_block_chars:
+            raise RuntimeError(f"{facility_name} の日付情報とURLが長すぎます")
 
         if current_lines:
             blocks.append({
                 "text": "\n".join(header + current_lines + tail),
                 "tags": {tag},
-                "facility_name": group["facility_name"],
+                "facility_name": facility_name,
             })
-
-    if common_url and all_tags:
-        footer = "\n".join([
-            "受付開始した施設の申し込みはこちらから確認できます。",
-            f"🔗 [施設申し込みを開く]({common_url})",
-        ])
-
-        if len(footer) > max_block_chars:
-            raise RuntimeError(
-                "共通URLの通知ブロックが長すぎます"
-            )
-
-        blocks.append({
-            "text": footer,
-            "tags": set(all_tags),
-            "facility_name": "施設申し込み",
-        })
 
     return blocks
 
@@ -649,14 +575,10 @@ def pack_notice_messages(blocks):
         description = block["text"]
 
         if len(title) > 256:
-            raise RuntimeError(
-                "Embedタイトルが長すぎます"
-            )
+            raise RuntimeError("Embedタイトルが長すぎます")
 
         if len(description) > 4096:
-            raise RuntimeError(
-                "Embed本文が長すぎます"
-            )
+            raise RuntimeError("Embed本文が長すぎます")
 
         embed = {
             "title": title,
@@ -694,13 +616,7 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(
-    target,
-    today,
-    months_to_scan,
-    previous_months,
-    is_baseline,
-):
+def scan_target(target, months_to_scan, previous_months, is_baseline):
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
@@ -712,21 +628,9 @@ def scan_target(
 
     for year, month in months_to_scan:
         month_key = f"{year:04d}-{month:02d}"
-
-        url = make_month_url(
-            target["url"],
-            year,
-            month,
-            base_date,
-        )
-
+        url = make_month_url(target["url"], year, month, base_date)
         html = fetch_html(url)
-
-        current = detect_daily_statuses(
-            html,
-            year,
-            month,
-        )
+        current = detect_daily_statuses(html, year, month)
 
         current_months[month_key] = current
         previous = previous_months.get(month_key, {})
@@ -768,85 +672,39 @@ def main():
     highlighted_ids = load_highlighted_ids(targets)
     auto_bookings = {}
     auto_ok = True
+
     try:
         auto_bookings = load_auto_bookings(targets)
+
         if auto_bookings and os.environ.get("GITHUB_ACTIONS") != "true":
             auto_bookings = {}
             raise RuntimeError("自動申込は GitHub Actions から実行してください")
     except (ValueError, RuntimeError) as error:
         print(f"自動申込設定エラー: {error}")
         auto_ok = False
+
     print(
         f"監視対象: {len(targets)}施設、"
         f"注目施設: {len(highlighted_ids)}施設"
     )
 
     state = load_state()
-    meta = state.setdefault("_meta", {})
-
     failures = []
     successful_results = []
     baseline_count = 0
-
-    is_release_day = today.day == 27
-    release_key = today.strftime("%Y-%m")
-
-    if is_release_day:
-        if meta.get("release_progress_month") != release_key:
-            meta["release_progress_month"] = release_key
-            meta["release_done_targets"] = []
-
-        release_done = set(
-            str(x) for x in meta.get("release_done_targets", [])
-        )
-
-        if meta.get("release_batch_sent") == release_key:
-            release_done = {
-                str(target["id"]) for target in targets
-            }
-            meta["release_done_targets"] = list(release_done)
-
-        print("\n【27日 受付開始通知モード】")
-    else:
-        release_done = set()
-
-    scan_targets = [
-        target
-        for target in targets
-        if not (
-            is_release_day
-            and str(target["id"]) in release_done
-            and str(target["id"]) not in auto_bookings
-        )
-    ]
-
-    if not scan_targets:
-        print("27日の対象施設はすべて処理済みです。")
-        if not auto_ok:
-            sys.exit(1)
-        return
-
     months_to_scan = target_months(today)
     jobs = {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for target in scan_targets:
+        for target in targets:
             target_id = str(target["id"])
             old_entry = state.get(target_id, {})
-
-            is_baseline = (
-                not old_entry
-                or "months" not in old_entry
-            )
-
+            is_baseline = not old_entry or "months" not in old_entry
             previous_months = old_entry.get("months", {})
-            if target_id in release_done:
-                previous_months = {}
 
             future = executor.submit(
                 scan_target,
                 target,
-                today,
                 months_to_scan,
                 previous_months,
                 is_baseline,
@@ -866,29 +724,17 @@ def main():
 
             except Exception as error:
                 failures.append(target_id)
-
-                print(
-                    f"ERROR target={target_id}: "
-                    f"{type(error).__name__}: {error}"
-                )
+                print(f"ERROR target={target_id}: {type(error).__name__}: {error}")
 
     all_notices = []
-    pending_tags = set()
-    target_tags = {}
     tag_current_data = {}
 
     for result in successful_results:
         target_id = result["target_id"]
         current_months = result["months"]
         entries = result["entries"]
-        if is_release_day and target_id in release_done:
-            continue
 
-        old_entry = state.setdefault(
-            target_id,
-            {"months": {}}
-        )
-
+        old_entry = state.setdefault(target_id, {"months": {}})
         old_months = old_entry.setdefault("months", {})
 
         pending_month_keys = {
@@ -897,22 +743,12 @@ def main():
         }
 
         for month_key, current_data in current_months.items():
-            if month_key not in pending_month_keys:
+            if month_key in pending_month_keys:
+                tag_current_data[(target_id, month_key)] = current_data
+            else:
                 old_months[month_key] = current_data
 
-        for month_key in pending_month_keys:
-            tag = (target_id, month_key)
-
-            pending_tags.add(tag)
-            target_tags.setdefault(target_id, set()).add(tag)
-            tag_current_data[tag] = current_months[month_key]
-
         all_notices.extend(entries)
-
-        if is_release_day and not pending_month_keys:
-            release_done.add(target_id)
-
-    meta["release_done_targets"] = sorted(release_done)
 
     save_state(state)
 
@@ -920,32 +756,18 @@ def main():
 
     if all_notices:
         try:
-            standard_title = "🆕"
-            highlighted_title = "🚨"
-
             highlighted_notices = []
             standard_notices = []
 
             for entry in all_notices:
-                if is_highlighted_entry(
-                    entry,
-                    highlighted_ids,
-                ):
+                if is_highlighted_entry(entry, highlighted_ids):
                     highlighted_notices.append(entry)
                 else:
                     standard_notices.append(entry)
 
             notice_groups = [
-                (
-                    highlighted_notices,
-                    highlighted_title,
-                    COLOR_HIGHLIGHTED,
-                ),
-                (
-                    standard_notices,
-                    standard_title,
-                    COLOR_STANDARD,
-                ),
+                (highlighted_notices, "🚨", COLOR_HIGHLIGHTED),
+                (standard_notices, "🆕", COLOR_STANDARD),
             ]
 
             all_blocks = []
@@ -954,38 +776,13 @@ def main():
                 if not notice_group:
                     continue
 
-                blocks = build_notice_blocks(
-                    notice_group,
-                    include_facility_urls=not is_release_day,
-                    common_url=None,
-                    max_block_chars=3800,
-                )
+                blocks = build_notice_blocks(notice_group)
 
                 for block in blocks:
-                    block["embed_title"] = (
-                        f'{title} {block["facility_name"]}'
-                    )
+                    block["embed_title"] = f'{title} {block["facility_name"]}'
                     block["color"] = color
 
                 all_blocks.extend(blocks)
-
-            if is_release_day and pending_tags:
-                if not COMMON_CALENDAR_URL.startswith(
-                    ("https://", "http://")
-                ):
-                    raise RuntimeError(
-                        "COMMON_CALENDAR_URLが正しくありません"
-                    )
-
-                all_blocks.append({
-                    "text": (
-                        "受付開始した施設の申し込みはこちらから確認できます。\n"
-                        f"🔗 [施設申し込みを開く]({COMMON_CALENDAR_URL})"
-                    ),
-                    "tags": set(pending_tags),
-                    "embed_title": "🔗 施設申し込み",
-                    "color": COLOR_COMMON,
-                })
 
             messages = pack_notice_messages(all_blocks)
 
@@ -993,42 +790,19 @@ def main():
 
             for index, message in enumerate(messages):
                 for tag in message["tags"]:
-                    tag_message_indexes.setdefault(
-                        tag,
-                        set()
-                    ).add(index)
+                    tag_message_indexes.setdefault(tag, set()).add(index)
 
             delivered_indexes = set()
             committed_tags = set()
-
             total_batches = len(messages)
 
-            print("\n通知メッセージ数:", len(messages))
-            print(
-                "Embed数:",
-                sum(
-                    len(message["embeds"])
-                    for message in messages
-                )
-            )
+            print("\n通知メッセージ数:", total_batches)
+            print("Embed数:", sum(len(message["embeds"]) for message in messages))
 
-            for batch_number, start in enumerate(
-                range(0, len(messages), 1),
-                start=1,
-            ):
-                batch = messages[start:start + 1]
-
-                print(
-                    f"Discord送信: "
-                    f"{batch_number}/{total_batches} "
-                    f"（{len(batch)}メッセージ）"
-                )
-
-                discord_webhook(batch)
-
-                delivered_indexes.update(
-                    range(start, start + len(batch))
-                )
+            for index, message in enumerate(messages):
+                print(f"Discord送信: {index + 1}/{total_batches} （1メッセージ）")
+                discord_webhook([message])
+                delivered_indexes.add(index)
 
                 for tag, indexes in tag_message_indexes.items():
                     if tag in committed_tags:
@@ -1036,54 +810,22 @@ def main():
 
                     if indexes.issubset(delivered_indexes):
                         target_id, month_key = tag
-
-                        state.setdefault(
-                            target_id,
-                            {"months": {}}
-                        )
-
-                        state[target_id].setdefault(
-                            "months", {}
-                        )[month_key] = tag_current_data[tag]
-
+                        state[target_id]["months"][month_key] = tag_current_data[tag]
                         committed_tags.add(tag)
-
-                if is_release_day:
-                    for target_id, tags in target_tags.items():
-                        if tags.issubset(committed_tags):
-                            release_done.add(target_id)
-
-                    meta["release_done_targets"] = sorted(
-                        release_done
-                    )
 
                 save_state(state)
 
-            print(
-                f"\n通知送信成功: "
-                f"{len(all_notices)}件"
-            )
+            print(f"\n通知送信成功: {len(all_notices)}件")
 
         except Exception as error:
             notification_error = error
-
-            print(
-                "\nDiscord通知エラー:",
-                f"{type(error).__name__}: {error}"
-            )
+            print("\nDiscord通知エラー:", f"{type(error).__name__}: {error}")
 
     else:
         print("\n新しい空室はありません。")
 
-    if is_release_day:
-        meta["release_done_targets"] = sorted(release_done)
-        save_state(state)
-
     if baseline_count:
-        print(
-            f"\n通知なしで基準を作成した施設数: "
-            f"{baseline_count}"
-        )
+        print(f"\n通知なしで基準を作成した施設数: {baseline_count}")
 
     if failures:
         print("失敗した施設:", ", ".join(failures))
