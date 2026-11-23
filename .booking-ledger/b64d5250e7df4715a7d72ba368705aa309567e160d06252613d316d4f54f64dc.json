@@ -2,5 +2,5 @@
   "facility_id": "test-08",
   "stay_date": "2026-12-07",
   "run_id": "45259830766",
-  "status": "pending"
+  "status": "email_sent"
 }
