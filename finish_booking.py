@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 SUBJECT_SUFFIX = "申込手続きのご案内"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -26,6 +26,10 @@ FIELDS = (
     "gender", "relationship", "contact_phone", "postal", "state", "address",
 )
 TIMEOUT = (5, 10)
+
+
+def compact(value):
+    return re.sub(r"\s+", "", value)
 
 
 def booking_origin():
@@ -85,7 +89,8 @@ def message_links(raw, facility):
     )
     if parseaddr(str(message.get("From", "")))[1].lower() != mail_sender():
         return set()
-    if str(message.get("Subject", "")).strip() != facility + SUBJECT_SUFFIX:
+    subject = str(message.get("Subject", ""))
+    if compact(subject) != compact(facility + SUBJECT_SUFFIX):
         return set()
     pattern = re.compile(
         re.escape(booking_origin() + "/apply/new?c=")
@@ -146,13 +151,22 @@ def form_at(page, current_url, path, correlation):
     return form, url
 
 
-def summary_mismatches(page, stay_date, facility):
-    def compact(value):
-        return re.sub(r"\s+", "", value)
+def service_name_text(value):
+    divider = value.find("br")
+    if divider is None:
+        return value.get_text()
 
+    nodes = iter(value.descendants)
+    for node in nodes:
+        if node is divider:
+            break
+    return "".join(node for node in nodes if type(node) is NavigableString)
+
+
+def summary_mismatches(page, stay_date, facility):
     day = date.fromisoformat(stay_date)
     expected = {
-        "申込対象サービス": compact(facility + "申込"),
+        "申込対象サービス": compact(facility),
         "希望日": f"{day.year}年{day.month}月{day.day}日より1泊",
         "宿泊人数": "2",
         "希望部屋数": "1",
@@ -176,19 +190,24 @@ def summary_mismatches(page, stay_date, facility):
         name = compact(label.get_text(strip=True)).rstrip(":：")
         if name not in expected:
             continue
-        text = value.get_text()
-        if name == "申込対象サービス":
-            parts = list(value.stripped_strings)
-            text = parts[-1] if parts else ""
-        text = compact(text)
+        text = compact(service_name_text(value) if name == "申込対象サービス" else value.get_text())
         if name == "希望日":
             match = re.fullmatch(r"([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日より1泊", text)
             if match:
                 year, month, day_number = map(int, match.groups())
                 text = f"{year}年{month}月{day_number}日より1泊"
         values.setdefault(name, set()).add(text)
-    return [name for name, expected_value in expected.items()
-            if values.get(name, {"2"} if name == "第一部屋人数" else set()) != {expected_value}]
+    mismatches = []
+    for name, expected_value in expected.items():
+        actual_values = values.get(name, {"2"} if name == "第一部屋人数" else set())
+        if name == "申込対象サービス":
+            if not expected_value or not actual_values or any(
+                expected_value not in actual for actual in actual_values
+            ):
+                mismatches.append(name)
+        elif actual_values != {expected_value}:
+            mismatches.append(name)
+    return mismatches
 
 
 def matching_summary(page, stay_date, facility):
