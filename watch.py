@@ -266,45 +266,32 @@ def load_auto_bookings(targets):
     return bookings
 
 
-def run_auto_bookings(bookings, results, today):
-    success = True
+def run_auto_booking(facility_id, day):
+    print(f"自動申込確認: {facility_id} {day}", flush=True)
 
-    for result in results:
-        facility_id = result["target_id"]
-
-        for stay_date in sorted(bookings.get(facility_id, ())):
-            day = stay_date.isoformat()
-            status = result["months"].get(day[:7], {}).get(day)
-
-            if stay_date < today or status not in ("○", "△"):
-                continue
-
-            print(f"自動申込確認: {facility_id} {day}", flush=True)
-
-            try:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(Path(__file__).with_name("apply_booking.py")),
-                        "--facility-id", facility_id,
-                        "--date", day,
-                        "--nights", "1",
-                        "--persons", "2",
-                        "--rooms", "1",
-                        "--room-persons", "2",
-                        "--finish-from-gmail",
-                    ],
-                    check=True,
-                    timeout=270,
-                )
-            except (subprocess.SubprocessError, OSError) as error:
-                print(
-                    f"自動申込を確認できませんでした: "
-                    f"{facility_id} {day} ({type(error).__name__})"
-                )
-                success = False
-
-    return success
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("apply_booking.py")),
+                "--facility-id", facility_id,
+                "--date", day,
+                "--nights", "1",
+                "--persons", "2",
+                "--rooms", "1",
+                "--room-persons", "2",
+                "--finish-from-gmail",
+            ],
+            check=True,
+            timeout=270,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        print(
+            f"自動申込を確認できませんでした: "
+            f"{facility_id} {day} ({type(error).__name__})"
+        )
+        return False
+    return True
 
 
 def is_highlighted_entry(entry, highlighted_ids):
@@ -662,7 +649,7 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(target, months_to_scan, previous_months, is_baseline):
+def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking):
     target_id = str(target["id"])
     name = target["name"]
     location = target["location"]
@@ -689,6 +676,10 @@ def scan_target(target, months_to_scan, previous_months, is_baseline):
             year,
             month,
         )
+
+        for day in booking_days:
+            if current.get(day) in ("○", "△"):
+                submit_booking(target_id, day)
 
         current_months[month_key] = current
         previous = previous_months.get(month_key, {})
@@ -724,6 +715,11 @@ def scan_target(target, months_to_scan, previous_months, is_baseline):
 
 
 def main():
+    with ThreadPoolExecutor(max_workers=1) as booking_executor:
+        monitor(booking_executor)
+
+
+def monitor(booking_executor):
     today = datetime.now(JST).date()
 
     targets = load_targets()
@@ -752,20 +748,38 @@ def main():
     baseline_count = 0
     months_to_scan = target_months(today)
     jobs = {}
+    booking_jobs = []
+    booking_lock = threading.Lock()
+
+    def submit_booking(facility_id, day):
+        print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
+        with booking_lock:
+            booking_jobs.append(booking_executor.submit(run_auto_booking, facility_id, day))
+
+    active_days = {
+        facility_id: sorted(day.isoformat() for day in days if day >= today)
+        for facility_id, days in auto_bookings.items()
+    }
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for target in targets:
+        for target in sorted(targets, key=lambda item: not active_days.get(str(item["id"]))):
             target_id = str(target["id"])
             old_entry = state.get(target_id, {})
             is_baseline = not old_entry or "months" not in old_entry
             previous_months = old_entry.get("months", {})
 
+            booking_days = active_days.get(target_id, ())
+            priority_months = {day[:7] for day in booking_days}
+            ordered_months = sorted(months_to_scan, key=lambda ym: f"{ym[0]:04d}-{ym[1]:02d}" not in priority_months)
+
             future = executor.submit(
                 scan_target,
                 target,
-                months_to_scan,
+                ordered_months,
                 previous_months,
                 is_baseline,
+                booking_days,
+                submit_booking,
             )
 
             jobs[future] = target_id
@@ -891,8 +905,9 @@ def main():
     if notification_error:
         print("通知の一部または全部が未完了です。")
 
-    if auto_bookings:
-        auto_ok = run_auto_bookings(auto_bookings, successful_results, today)
+    for job in booking_jobs:
+        if not job.result():
+            auto_ok = False
 
     if failures or notification_error or not auto_ok:
         sys.exit(1)
