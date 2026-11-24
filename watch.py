@@ -1,3 +1,7 @@
+import time
+
+SCRIPT_START = time.perf_counter()
+
 import json
 import os
 import re
@@ -5,7 +9,7 @@ import sys
 import subprocess
 import calendar
 import threading
-import time
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -46,6 +50,26 @@ WEEKDAY_MAP = {
 }
 
 WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def log_duration(label, start, end, result="完了"):
+    print(
+        f"[監視計測] {label} | {result} | 所要 {(end - start) * 1000:.1f} ms"
+        f" | 監視開始から {(start - SCRIPT_START) * 1000:.1f} → {(end - SCRIPT_START) * 1000:.1f} ms",
+        flush=True,
+    )
+
+
+@contextmanager
+def timed_step(label):
+    start = time.perf_counter()
+    try:
+        yield
+    except BaseException:
+        log_duration(label, start, time.perf_counter(), "中断")
+        raise
+    else:
+        log_duration(label, start, time.perf_counter())
 
 
 def get_session():
@@ -266,25 +290,30 @@ def load_auto_bookings(targets):
     return bookings
 
 
-def run_auto_booking(facility_id, day):
+def run_auto_booking(facility_id, day, detected_at):
+    key = f"{facility_id} {day}"
+    log_duration("申込ワーカー待ち " + key, detected_at, time.perf_counter())
     print(f"自動申込確認: {facility_id} {day}", flush=True)
 
     try:
-        subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("apply_booking.py")),
-                "--facility-id", facility_id,
-                "--date", day,
-                "--nights", "1",
-                "--persons", "2",
-                "--rooms", "1",
-                "--room-persons", "2",
-                "--finish-from-gmail",
-            ],
-            check=True,
-            timeout=270,
-        )
+        with timed_step("申込子プロセス全体 " + key):
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("apply_booking.py")),
+                    "--facility-id", facility_id,
+                    "--date", day,
+                    "--nights", "1",
+                    "--persons", "2",
+                    "--rooms", "1",
+                    "--room-persons", "2",
+                    "--finish-from-gmail",
+                ],
+                env={**os.environ, "BOOKING_DETECTED_AT": str(detected_at),
+                     "BOOKING_LAUNCHED_AT": str(time.perf_counter()), "BOOKING_TIMING_KEY": key},
+                check=True,
+                timeout=270,
+            )
     except (subprocess.SubprocessError, OSError) as error:
         print(
             f"自動申込を確認できませんでした: "
@@ -484,7 +513,8 @@ def discord_webhook(messages):
                             min(retry_after, 60.0),
                         )
 
-                        time.sleep(wait_time)
+                        with timed_step("Discord 429 再試行待ち"):
+                            time.sleep(wait_time)
                         continue
 
                     if not 200 <= response.status_code < 300:
@@ -649,8 +679,9 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking):
+def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking, queued_at):
     target_id = str(target["id"])
+    log_duration(f"監視ワーカー待ち {target_id}", queued_at, time.perf_counter())
     name = target["name"]
     location = target["location"]
     nights = target["nights"]
@@ -669,13 +700,15 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
             base_date,
         )
 
-        html = fetch_html(url)
+        with timed_step(f"カレンダー GET {target_id} {month_key}"):
+            html = fetch_html(url)
 
-        current = detect_daily_statuses(
-            html,
-            year,
-            month,
-        )
+        with timed_step(f"カレンダー解析 {target_id} {month_key}"):
+            current = detect_daily_statuses(
+                html,
+                year,
+                month,
+            )
 
         for day in booking_days:
             if current.get(day) in ("○", "△"):
@@ -722,13 +755,15 @@ def main():
 def monitor(booking_executor):
     today = datetime.now(JST).date()
 
-    targets = load_targets()
-    highlighted_ids = load_highlighted_ids(targets)
+    with timed_step("施設・注目設定読込"):
+        targets = load_targets()
+        highlighted_ids = load_highlighted_ids(targets)
     auto_bookings = {}
     auto_ok = True
 
     try:
-        auto_bookings = load_auto_bookings(targets)
+        with timed_step("自動申込設定読込"):
+            auto_bookings = load_auto_bookings(targets)
 
         if auto_bookings and os.environ.get("GITHUB_ACTIONS") != "true":
             auto_bookings = {}
@@ -742,7 +777,8 @@ def monitor(booking_executor):
         f"注目施設: {len(highlighted_ids)}施設"
     )
 
-    state = load_state()
+    with timed_step("状態読込"):
+        state = load_state()
     failures = []
     successful_results = []
     baseline_count = 0
@@ -752,9 +788,10 @@ def monitor(booking_executor):
     booking_lock = threading.Lock()
 
     def submit_booking(facility_id, day):
+        detected_at = time.perf_counter()
         print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
         with booking_lock:
-            booking_jobs.append(booking_executor.submit(run_auto_booking, facility_id, day))
+            booking_jobs.append(booking_executor.submit(run_auto_booking, facility_id, day, detected_at))
 
     active_days = {
         facility_id: sorted(day.isoformat() for day in days if day >= today)
@@ -780,6 +817,7 @@ def monitor(booking_executor):
                 is_baseline,
                 booking_days,
                 submit_booking,
+                time.perf_counter(),
             )
 
             jobs[future] = target_id
@@ -801,79 +839,83 @@ def monitor(booking_executor):
     all_notices = []
     tag_current_data = {}
 
-    for result in successful_results:
-        target_id = result["target_id"]
-        current_months = result["months"]
-        entries = result["entries"]
+    with timed_step("差分集計"):
+        for result in successful_results:
+            target_id = result["target_id"]
+            current_months = result["months"]
+            entries = result["entries"]
 
-        old_entry = state.setdefault(target_id, {"months": {}})
-        old_months = old_entry.setdefault("months", {})
+            old_entry = state.setdefault(target_id, {"months": {}})
+            old_months = old_entry.setdefault("months", {})
 
-        pending_month_keys = {
-            date.fromisoformat(entry["day"]).strftime("%Y-%m")
-            for entry in entries
-        }
+            pending_month_keys = {
+                date.fromisoformat(entry["day"]).strftime("%Y-%m")
+                for entry in entries
+            }
 
-        for month_key, current_data in current_months.items():
-            if month_key in pending_month_keys:
-                tag_current_data[(target_id, month_key)] = current_data
-            else:
-                old_months[month_key] = current_data
+            for month_key, current_data in current_months.items():
+                if month_key in pending_month_keys:
+                    tag_current_data[(target_id, month_key)] = current_data
+                else:
+                    old_months[month_key] = current_data
 
-        all_notices.extend(entries)
+            all_notices.extend(entries)
 
-    save_state(state)
+    with timed_step("状態保存"):
+        save_state(state)
 
     notification_error = None
 
     if all_notices:
         try:
-            highlighted_notices = []
-            standard_notices = []
+            with timed_step("通知組立"):
+                highlighted_notices = []
+                standard_notices = []
 
-            for entry in all_notices:
-                if is_highlighted_entry(entry, highlighted_ids):
-                    highlighted_notices.append(entry)
-                else:
-                    standard_notices.append(entry)
+                for entry in all_notices:
+                    if is_highlighted_entry(entry, highlighted_ids):
+                        highlighted_notices.append(entry)
+                    else:
+                        standard_notices.append(entry)
 
-            notice_groups = [
-                (highlighted_notices, "🚨", COLOR_HIGHLIGHTED),
-                (standard_notices, "🆕", COLOR_STANDARD),
-            ]
+                notice_groups = [
+                    (highlighted_notices, "🚨", COLOR_HIGHLIGHTED),
+                    (standard_notices, "🆕", COLOR_STANDARD),
+                ]
 
-            all_blocks = []
+                all_blocks = []
 
-            for notice_group, title, color in notice_groups:
-                if not notice_group:
-                    continue
+                for notice_group, title, color in notice_groups:
+                    if not notice_group:
+                        continue
 
-                blocks = build_notice_blocks(notice_group)
+                    blocks = build_notice_blocks(notice_group)
 
-                for block in blocks:
-                    block["embed_title"] = f'{title} {block["facility_name"]}'
-                    block["color"] = color
+                    for block in blocks:
+                        block["embed_title"] = f'{title} {block["facility_name"]}'
+                        block["color"] = color
 
-                all_blocks.extend(blocks)
+                    all_blocks.extend(blocks)
 
-            messages = pack_notice_messages(all_blocks)
+                messages = pack_notice_messages(all_blocks)
 
-            tag_message_indexes = {}
+                tag_message_indexes = {}
 
-            for index, message in enumerate(messages):
-                for tag in message["tags"]:
-                    tag_message_indexes.setdefault(tag, set()).add(index)
+                for index, message in enumerate(messages):
+                    for tag in message["tags"]:
+                        tag_message_indexes.setdefault(tag, set()).add(index)
 
-            delivered_indexes = set()
-            committed_tags = set()
-            total_batches = len(messages)
+                delivered_indexes = set()
+                committed_tags = set()
+                total_batches = len(messages)
 
             print("\n通知メッセージ数:", total_batches)
             print("Embed数:", sum(len(message["embeds"]) for message in messages))
 
             for index, message in enumerate(messages):
                 print(f"Discord送信: {index + 1}/{total_batches} （1メッセージ）")
-                discord_webhook([message])
+                with timed_step(f"Discord送信 {index + 1}/{total_batches}"):
+                    discord_webhook([message])
                 delivered_indexes.add(index)
 
                 for tag, indexes in tag_message_indexes.items():
@@ -885,7 +927,8 @@ def monitor(booking_executor):
                         state[target_id]["months"][month_key] = tag_current_data[tag]
                         committed_tags.add(tag)
 
-                save_state(state)
+                with timed_step("通知後の状態保存"):
+                    save_state(state)
 
             print(f"\n通知送信成功: {len(all_notices)}件")
 
@@ -905,13 +948,16 @@ def monitor(booking_executor):
     if notification_error:
         print("通知の一部または全部が未完了です。")
 
-    for job in booking_jobs:
-        if not job.result():
-            auto_ok = False
+    with timed_step("残りの申込完了待ち"):
+        for job in booking_jobs:
+            if not job.result():
+                auto_ok = False
 
     if failures or notification_error or not auto_ok:
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    log_duration("初期読込", SCRIPT_START, time.perf_counter())
+    with timed_step("監視全体"):
+        main()
