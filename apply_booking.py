@@ -1,12 +1,17 @@
 """Search availability and request email verification for an application."""
 
+import time
+
+SCRIPT_START = time.perf_counter()
+START_UTC = time.time()
+
 import argparse
 import json
 import os
 import re
 import sys
-import time
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -16,6 +21,26 @@ from booking_ledger import BookingLedger
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
 TIMEOUT = (10, 30)
+
+
+@contextmanager
+def timed_step(label):
+    start = time.perf_counter()
+    outcome = "完了"
+    try:
+        yield
+    except BaseException:
+        outcome = "中断"
+        raise
+    finally:
+        end = time.perf_counter()
+        key = os.environ.get("BOOKING_TIMING_KEY", "")
+        print(
+            f"[申込計測] {key} {label} | {outcome} | 所要 {(end - start) * 1000:.1f} ms"
+            f" | スクリプト開始から {(start - SCRIPT_START) * 1000:.1f}"
+            f" → {(end - SCRIPT_START) * 1000:.1f} ms",
+            flush=True,
+        )
 
 
 def parse_args():
@@ -153,17 +178,19 @@ def submit_email(session, page, current_url, email):
 
 
 def main():
-    args = parse_args()
-    if date.fromisoformat(args.date).isoformat() != args.date:
-        fail("宿泊日は YYYY-MM-DD で指定してください")
-    args.email = args.email.strip()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+", args.email):
-        fail("BOOKING_EMAILに有効なメールアドレスを設定してください")
+    with timed_step("引数・日付確認"):
+        args = parse_args()
+        if date.fromisoformat(args.date).isoformat() != args.date:
+            fail("宿泊日は YYYY-MM-DD で指定してください")
+        args.email = args.email.strip()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+", args.email):
+            fail("BOOKING_EMAILに有効なメールアドレスを設定してください")
 
     ledger = None
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        ledger = BookingLedger(args.facility_id, args.date)
-        status = ledger.existing_status()
+        with timed_step("申込履歴確認"):
+            ledger = BookingLedger(args.facility_id, args.date)
+            status = ledger.existing_status()
         if status == "pending":
             print(f"::warning::{args.facility_id} {args.date}: 前回の結果が未確定です。確認メールと申込状況を確認してください。")
             return
@@ -183,7 +210,8 @@ def main():
     if sum(room_persons) != args.persons:
         fail("The room guest counts must add up to --persons")
 
-    target, apply_url = get_apply_target(args.facility_id)
+    with timed_step("施設設定読込"):
+        target, apply_url = get_apply_target(args.facility_id)
     finish_enabled = args.finish_from_gmail
     if finish_enabled and ledger is None:
         fail("Gmailによる自動確定は GitHub Actions から実行してください")
@@ -196,122 +224,129 @@ def main():
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
-    response = session.get(apply_url, timeout=TIMEOUT)
-    response.raise_for_status()
-    page = BeautifulSoup(response.text, "lxml")
-    form = page.select_one("form#new_apply")
-    csrf_meta = page.select_one('meta[name="csrf-token"]')
-    csrf_token = csrf_meta.get("content") if csrf_meta else ""
+    with timed_step("申込フォーム GET"):
+        response = session.get(apply_url, timeout=TIMEOUT)
+        response.raise_for_status()
+    with timed_step("フォーム解析・検索条件準備"):
+        page = BeautifulSoup(response.text, "lxml")
+        form = page.select_one("form#new_apply")
+        csrf_meta = page.select_one('meta[name="csrf-token"]')
+        csrf_token = csrf_meta.get("content") if csrf_meta else ""
 
-    if not csrf_token:
-        raise RuntimeError("CSRF tokenが取得できません")
-    if not form:
-        fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
+        if not csrf_token:
+            raise RuntimeError("CSRF tokenが取得できません")
+        if not form:
+            fail("申込フォームが見つかりません。ログイン画面・エラー画面・画面変更の可能性があります")
 
-    form_data = form_values(form)
-    dates = {option.get("value") for option in form.select("select[name='apply[join_time]'] option")}
-    if args.date not in dates:
-        fail("指定日は現在申込可能な日付一覧にありません")
-    form_data.update({
-        "apply[join_time]": args.date,
-        "apply[night_count]": str(args.nights),
-        "apply[stay_persons]": str(args.persons),
-        "apply[hope_rooms]": str(args.rooms),
-    })
-    for index, count in enumerate(room_persons, start=1):
-        form_data[f"apply[hope_room{index}]"] = str(count)
-    search_button = page.select_one("input[value='空き検索'][onclick]")
-    token_match = re.search(r"coma_search\(['\"]([^'\"]+)", search_button.get("onclick", "")) if search_button else None
-    if not token_match:
-        fail("空き検索用のページ情報を特定できません")
-    search_url = booking_url(response.url, "empty_new?s=" + token_match.group(1))
-    search_response = session.post(
-        search_url,
-        data=form_data,
-        headers={
-            "X-Requested-With": "XMLHttpRequest",
-            "X-CSRF-Token": csrf_token,
-            "Referer": response.url,
-            "Origin": booking_origin(),
-            "Accept": "*/*",
-        },
-        timeout=TIMEOUT,
-    )
-    search_response.raise_for_status()
-    html_match = re.search(
-        r"""\$\('#coma'\)\.html\(""",
-        search_response.text
-    )
-
-    if not html_match:
-        fail("空室一覧を含むJavaScriptレスポンスが見つかりません")
-
-    js_literal = search_response.text[html_match.end():].lstrip()
-    js_literal = js_literal.replace(r"\$", "$")
-    js_literal = js_literal.replace(r"\'", "'")
-
-    try:
-        html_fragment, _ = json.JSONDecoder().raw_decode(js_literal)
-    except json.JSONDecodeError as error:
-        fail(f"検索結果のHTMLを取り出せません: {error}")
-
-    results = BeautifulSoup(html_fragment, "lxml")
-
-    checkboxes = results.select(
-        "#coma_search_result input[type='checkbox'][name^='apply[coma[']"
-    )
-
-    if not checkboxes:
-        fail("空室検索結果にチェックボックスがありません")
-
-    rows = []
-    for checkbox in checkboxes:
-        row = checkbox.find_parent("tr")
-        cells = [cell.get_text(" ", strip=True) for cell in row.select("td")] if row else []
-        if len(cells) < 6:
-            continue
-        room_no = int(cells[1]) if cells[1].isdigit() else None
-        capacity = re.search(r"(\d+)\s*[～〜~]\s*(\d+)", cells[4])
-        if cells[5] != "空き" or not capacity or not room_no:
-            continue
-        low, high = map(int, capacity.groups())
-        wanted = room_persons[0]
-        if len(room_persons) == 1 and low <= wanted <= high:
-            rows.append((room_no, checkbox.get("name"), checkbox.get("value"), cells))
-
-    if args.room_number is not None:
-        rows = [item for item in rows if item[0] == args.room_number]
-
-    if not rows:
-        fail("希望人数に合う空室が見つかりません")
-
-    chosen = sorted(
-        rows,
-        key=lambda item: (
-            -int(re.search(r"\d+\s*[～〜~]\s*(\d+)", item[3][4]).group(1)),
-            item[0]
+        form_data = form_values(form)
+        dates = {option.get("value") for option in form.select("select[name='apply[join_time]'] option")}
+        if args.date not in dates:
+            fail("指定日は現在申込可能な日付一覧にありません")
+        form_data.update({
+            "apply[join_time]": args.date,
+            "apply[night_count]": str(args.nights),
+            "apply[stay_persons]": str(args.persons),
+            "apply[hope_rooms]": str(args.rooms),
+        })
+        for index, count in enumerate(room_persons, start=1):
+            form_data[f"apply[hope_room{index}]"] = str(count)
+        search_button = page.select_one("input[value='空き検索'][onclick]")
+        token_match = re.search(r"coma_search\(['\"]([^'\"]+)", search_button.get("onclick", "")) if search_button else None
+        if not token_match:
+            fail("空き検索用のページ情報を特定できません")
+        search_url = booking_url(response.url, "empty_new?s=" + token_match.group(1))
+    with timed_step("部屋検索 POST"):
+        search_response = session.post(
+            search_url,
+            data=form_data,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-Token": csrf_token,
+                "Referer": response.url,
+                "Origin": booking_origin(),
+                "Accept": "*/*",
+            },
+            timeout=TIMEOUT,
         )
-    )[0]
+        search_response.raise_for_status()
+    with timed_step("検索結果解析・選択欄確認"):
+        html_match = re.search(
+            r"""\$\('#coma'\)\.html\(""",
+            search_response.text
+        )
 
-    print(f"選択: 部屋番号 {chosen[0]} / {chosen[3][3]} / 定員 {chosen[3][4]} / {chosen[3][5]}")
-    # Only 1 room is advanced automatically until multi-room result semantics are confirmed.
-    if args.rooms != 1:
-        fail("現在の実装は1室の選択までです。複数室では部屋割りと連泊の対応を追加してください")
-    for key in list(form_data):
-        if key.startswith("apply[coma["):
-            del form_data[key]
-    form_data[chosen[1]] = chosen[2]
-    session_guid = results.select_one("input[name='apply_session_guid']")
-    if not session_guid:
-        fail("検索結果の一時セッション情報が見つかりません")
-    form_data[session_guid["name"]] = session_guid.get("value", "")
+        if not html_match:
+            fail("空室一覧を含むJavaScriptレスポンスが見つかりません")
 
-    create_url = booking_url(response.url, form.get("action", ""))
-    sha = ledger.write("pending") if ledger else None
+        js_literal = search_response.text[html_match.end():].lstrip()
+        js_literal = js_literal.replace(r"\$", "$")
+        js_literal = js_literal.replace(r"\'", "'")
+
+        try:
+            html_fragment, _ = json.JSONDecoder().raw_decode(js_literal)
+        except json.JSONDecodeError as error:
+            fail(f"検索結果のHTMLを取り出せません: {error}")
+
+        results = BeautifulSoup(html_fragment, "lxml")
+
+        checkboxes = results.select(
+            "#coma_search_result input[type='checkbox'][name^='apply[coma[']"
+        )
+
+        if not checkboxes:
+            fail("空室検索結果にチェックボックスがありません")
+
+    with timed_step("部屋選択・送信準備"):
+        rows = []
+        for checkbox in checkboxes:
+            row = checkbox.find_parent("tr")
+            cells = [cell.get_text(" ", strip=True) for cell in row.select("td")] if row else []
+            if len(cells) < 6:
+                continue
+            room_no = int(cells[1]) if cells[1].isdigit() else None
+            capacity = re.search(r"(\d+)\s*[～〜~]\s*(\d+)", cells[4])
+            if cells[5] != "空き" or not capacity or not room_no:
+                continue
+            low, high = map(int, capacity.groups())
+            wanted = room_persons[0]
+            if len(room_persons) == 1 and low <= wanted <= high:
+                rows.append((room_no, checkbox.get("name"), checkbox.get("value"), cells))
+
+        if args.room_number is not None:
+            rows = [item for item in rows if item[0] == args.room_number]
+
+        if not rows:
+            fail("希望人数に合う空室が見つかりません")
+
+        chosen = sorted(
+            rows,
+            key=lambda item: (
+                -int(re.search(r"\d+\s*[～〜~]\s*(\d+)", item[3][4]).group(1)),
+                item[0]
+            )
+        )[0]
+
+        print(f"選択: 部屋番号 {chosen[0]} / {chosen[3][3]} / 定員 {chosen[3][4]} / {chosen[3][5]}")
+        # Only 1 room is advanced automatically until multi-room result semantics are confirmed.
+        if args.rooms != 1:
+            fail("現在の実装は1室の選択までです。複数室では部屋割りと連泊の対応を追加してください")
+        for key in list(form_data):
+            if key.startswith("apply[coma["):
+                del form_data[key]
+        form_data[chosen[1]] = chosen[2]
+        session_guid = results.select_one("input[name='apply_session_guid']")
+        if not session_guid:
+            fail("検索結果の一時セッション情報が見つかりません")
+        form_data[session_guid["name"]] = session_guid.get("value", "")
+
+        create_url = booking_url(response.url, form.get("action", ""))
+    with timed_step("申込前の履歴記録"):
+        sha = ledger.write("pending") if ledger else None
     try:
         since_ms = request_confirmation_email(session, create_url, form_data, args.email)
         if ledger:
-            sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
+            with timed_step("メール送信済み記録"):
+                sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
     except Exception as error:
         raise RuntimeError(
             f"部屋選択以降の結果を確定できません。詳細: {booking_failure_detail(error)}。"
@@ -323,8 +358,9 @@ def main():
         return
 
     try:
-        oauth, profile = config_from_env()
-        headers = gmail_headers(oauth, args.email)
+        with timed_step("Gmail認証準備"):
+            oauth, profile = config_from_env()
+            headers = gmail_headers(oauth, args.email)
     except Exception as error:
         raise RuntimeError(
             f"案内メールの送信完了画面は確認済みです。"
@@ -337,10 +373,12 @@ def main():
         sha = ledger.write("finalizing", sha)
 
     try:
-        final_submission(
-            headers, profile, since_ms, args.date, booking_name, mark_finalizing
-        )
-        ledger.write("accepted", sha)
+        with timed_step("受付メール照合・最終申込"):
+            final_submission(
+                headers, profile, since_ms, args.date, booking_name, mark_finalizing
+            )
+        with timed_step("受付済み記録"):
+            ledger.write("accepted", sha)
     except Exception as error:
         # HTTP exceptions can include the booking URL. Keep it out of Action logs.
         detail = str(error) if type(error) is RuntimeError else type(error).__name__
@@ -397,14 +435,16 @@ def booking_step(label, operation, *args):
 
 def request_confirmation_email(session, create_url, form_data, email):
     print("部屋選択リクエストを送信します", flush=True)
-    final = session.post(create_url, data=form_data, timeout=TIMEOUT, allow_redirects=True)
-    final.raise_for_status()
+    with timed_step("部屋選択 POST"):
+        final = session.post(create_url, data=form_data, timeout=TIMEOUT, allow_redirects=True)
+        final.raise_for_status()
     final_page = BeautifulSoup(final.text, "lxml")
     if "申込データにエラー" in final_page.get_text(" ", strip=True):
         fail("施設側で申込エラーになりました。部屋は選択されていない可能性があります")
     if "/apply/rule" in final.url or "個人情報の取り扱い" in final_page.get_text(" ", strip=True):
         print("同意画面を確認しました", flush=True)
-        final = booking_step("同意操作", submit_consent, session, final_page, final.url)
+        with timed_step("同意送信"):
+            final = booking_step("同意操作", submit_consent, session, final_page, final.url)
         final_page = BeautifulSoup(final.text, "lxml")
 
     # The email page can contain nested form tags. Use browser HTML parsing
@@ -415,7 +455,8 @@ def request_confirmation_email(session, create_url, form_data, email):
 
     since_ms = time.time_ns() // 1_000_000
     print("メール入力画面を確認しました", flush=True)
-    sent = booking_step("メール送信", submit_email, session, final_page, final.url, email)
+    with timed_step("確認メール送信"):
+        sent = booking_step("メール送信", submit_email, session, final_page, final.url, email)
     sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
     response_page = BeautifulSoup(sent.text, "lxml")
     result = response_page.select_one("section.request-box")
@@ -431,9 +472,21 @@ def request_confirmation_email(session, create_url, form_data, email):
 
 
 if __name__ == "__main__":
+    loaded = time.perf_counter()
+    origin = datetime.fromtimestamp(START_UTC, timezone.utc).isoformat(timespec="milliseconds")
+    print(f"[計測] スクリプト開始 {origin} | 初期読込 {(loaded - SCRIPT_START) * 1000:.1f} ms", flush=True)
+    for variable, label in (("BOOKING_DETECTED_AT", "検知からスクリプト開始"),
+                            ("BOOKING_LAUNCHED_AT", "子プロセス起動からスクリプト開始")):
+        try:
+            elapsed = SCRIPT_START - float(os.environ[variable])
+        except (ValueError, KeyError):
+            continue
+        print(f"[申込計測] {label} {elapsed * 1000:.1f} ms", flush=True)
     try:
         main()
     except Exception as error:
         detail = "通信またはHTTPエラー" if isinstance(error, requests.RequestException) else str(error)
         print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        print(f"[計測] 申込スクリプト合計 {(time.perf_counter() - SCRIPT_START) * 1000:.1f} ms", flush=True)
