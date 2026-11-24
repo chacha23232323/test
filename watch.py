@@ -9,7 +9,7 @@ import sys
 import subprocess
 import calendar
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -679,7 +679,46 @@ def pack_notice_messages(blocks):
     return messages
 
 
-def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking, queued_at):
+RECHECK_OFFSETS = (15, 30, 45)
+
+
+def recheck_month(target_id, year, month, url, days, started, submit_booking, request_slots):
+    label = f"{target_id} {year:04d}-{month:02d}"
+    remaining = set(days)
+    had_error = False
+    for offset in RECHECK_OFFSETS:
+        if not remaining:
+            break
+        deadline = started + offset
+        delay = deadline - time.perf_counter()
+        if delay <= 0:
+            continue
+        time.sleep(delay)
+        # Skip stale slots instead of issuing catch-up requests after a slow response.
+        latest = deadline + 15
+        wait = latest - time.perf_counter()
+        if wait <= 0 or not request_slots.acquire(timeout=wait):
+            continue
+        try:
+            if time.perf_counter() >= latest:
+                continue
+            with timed_step(f"追加カレンダー GET {label} +{offset}秒"):
+                html = fetch_html(url)
+            with timed_step(f"追加カレンダー解析 {label} +{offset}秒"):
+                current = detect_daily_statuses(html, year, month)
+            for day in sorted(remaining):
+                if current.get(day) in ("○", "△"):
+                    submit_booking(target_id, day)
+                    remaining.remove(day)
+        except Exception as error:
+            print(f"追加確認失敗 {label} +{offset}秒 ({type(error).__name__})", flush=True)
+            had_error = True
+        finally:
+            request_slots.release()
+    return not had_error
+
+
+def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking, queued_at, schedule_recheck):
     target_id = str(target["id"])
     log_duration(f"監視ワーカー待ち {target_id}", queued_at, time.perf_counter())
     name = target["name"]
@@ -700,19 +739,20 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
             base_date,
         )
 
-        with timed_step(f"カレンダー GET {target_id} {month_key}"):
-            html = fetch_html(url)
-
-        with timed_step(f"カレンダー解析 {target_id} {month_key}"):
-            current = detect_daily_statuses(
-                html,
-                year,
-                month,
-            )
-
-        for day in booking_days:
-            if current.get(day) in ("○", "△"):
-                submit_booking(target_id, day)
+        remaining = [day for day in booking_days if day[:7] == month_key]
+        started = time.perf_counter()
+        try:
+            with timed_step(f"カレンダー GET {target_id} {month_key}"):
+                html = fetch_html(url)
+            with timed_step(f"カレンダー解析 {target_id} {month_key}"):
+                current = detect_daily_statuses(html, year, month)
+            for day in remaining.copy():
+                if current.get(day) in ("○", "△"):
+                    submit_booking(target_id, day)
+                    remaining.remove(day)
+        finally:
+            if remaining:
+                schedule_recheck(target_id, year, month, url, remaining, started)
 
         current_months[month_key] = current
         previous = previous_months.get(month_key, {})
@@ -748,11 +788,12 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
 
 
 def main():
-    with ThreadPoolExecutor(max_workers=1) as booking_executor:
-        monitor(booking_executor)
+    with ExitStack() as background:
+        booking_executor = background.enter_context(ThreadPoolExecutor(max_workers=1))
+        monitor(booking_executor, background)
 
 
-def monitor(booking_executor):
+def monitor(booking_executor, background):
     today = datetime.now(JST).date()
 
     with timed_step("施設・注目設定読込"):
@@ -786,11 +827,25 @@ def monitor(booking_executor):
     jobs = {}
     booking_jobs = []
     booking_lock = threading.Lock()
+    submitted = set()
+    recheck_jobs = []
+    request_slots = threading.BoundedSemaphore(MAX_WORKERS)
+
+    def schedule_recheck(target_id, year, month, url, days, started):
+        job = recheck_executor.submit(
+            recheck_month, target_id, year, month, url, days, started, submit_booking, request_slots
+        )
+        with booking_lock:
+            recheck_jobs.append(job)
 
     def submit_booking(facility_id, day):
         detected_at = time.perf_counter()
-        print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
         with booking_lock:
+            key = (facility_id, day)
+            if key in submitted:
+                return
+            submitted.add(key)
+            print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
             booking_jobs.append(booking_executor.submit(run_auto_booking, facility_id, day, detected_at))
 
     active_days = {
@@ -798,6 +853,9 @@ def monitor(booking_executor):
         for facility_id, days in auto_bookings.items()
     }
 
+    month_keys = {f"{year:04d}-{month:02d}" for year, month in months_to_scan}
+    recheck_count = sum(len({day[:7] for day in days} & month_keys) for days in active_days.values())
+    recheck_executor = background.enter_context(ThreadPoolExecutor(max_workers=max(1, recheck_count)))
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for target in sorted(targets, key=lambda item: not active_days.get(str(item["id"]))):
             target_id = str(target["id"])
@@ -818,6 +876,7 @@ def monitor(booking_executor):
                 booking_days,
                 submit_booking,
                 time.perf_counter(),
+                schedule_recheck,
             )
 
             jobs[future] = target_id
@@ -947,6 +1006,12 @@ def monitor(booking_executor):
 
     if notification_error:
         print("通知の一部または全部が未完了です。")
+
+    if recheck_jobs:
+        with timed_step("追加確認の完了待ち"):
+            for job in recheck_jobs:
+                if not job.result():
+                    auto_ok = False
 
     with timed_step("残りの申込完了待ち"):
         for job in booking_jobs:
