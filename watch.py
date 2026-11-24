@@ -679,14 +679,14 @@ def pack_notice_messages(blocks):
     return messages
 
 
-RECHECK_OFFSETS = (15, 30, 45)
+RECHECK_INTERVAL = 5
 
 
 def recheck_month(target_id, year, month, url, days, started, submit_booking, request_slots):
     label = f"{target_id} {year:04d}-{month:02d}"
     remaining = set(days)
     had_error = False
-    for offset in RECHECK_OFFSETS:
+    for offset in range(RECHECK_INTERVAL, 60, RECHECK_INTERVAL):
         if not remaining:
             break
         deadline = started + offset
@@ -695,7 +695,7 @@ def recheck_month(target_id, year, month, url, days, started, submit_booking, re
             continue
         time.sleep(delay)
         # Skip stale slots instead of issuing catch-up requests after a slow response.
-        latest = deadline + 15
+        latest = deadline + RECHECK_INTERVAL
         wait = latest - time.perf_counter()
         if wait <= 0 or not request_slots.acquire(timeout=wait):
             continue
