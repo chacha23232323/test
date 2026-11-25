@@ -55,7 +55,7 @@ jobs:
           BOOKING_EMAIL: ${{ secrets.BOOKING_EMAIL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           COMMON_CALENDAR_URL: ${{ secrets.COMMON_CALENDAR_URL }}
-        run: python watch.py
+        run: python watch.py --hourly
 
       - name: Persist state
         if: always() && steps.watch.outcome != 'skipped'
