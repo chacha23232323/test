@@ -679,7 +679,7 @@ def pack_notice_messages(blocks):
     return messages
 
 
-RECHECK_INTERVAL = 5
+RECHECK_INTERVAL = 4
 
 
 def recheck_month(target_id, year, month, url, days, started, submit_booking, request_slots):
