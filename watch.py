@@ -175,14 +175,7 @@ def parse_highlight_weekdays(label, line_number):
     return weekdays
 
 
-def load_highlighted_ids(targets):
-    try:
-        lines = Path("highlight.md").read_text(
-            encoding="utf-8-sig"
-        ).splitlines()
-    except FileNotFoundError:
-        raise RuntimeError("highlight.md がありません") from None
-
+def load_highlighted_ids(targets, lines):
     target_ids = [str(target["id"]) for target in targets]
     valid_ids = set(target_ids)
 
@@ -240,9 +233,8 @@ def load_highlighted_ids(targets):
     return highlighted_ids
 
 
-def load_auto_bookings(targets):
+def load_auto_bookings(targets, lines):
     valid_ids = {str(target["id"]) for target in targets}
-    lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
     sections = [
         index
         for index, line in enumerate(lines)
@@ -787,24 +779,72 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
     }
 
 
-def main():
-    with ExitStack() as background:
-        booking_executor = background.enter_context(ThreadPoolExecutor(max_workers=1))
-        monitor(booking_executor, background)
+def fetch_checklist():
+    branch = os.environ.get("BOOKING_BRANCH") or "main"
+    subprocess.run(["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}"],
+                   check=True, timeout=20)
+    snapshot = subprocess.check_output(["git", "show", "FETCH_HEAD:highlight.md"], timeout=5)
+    return snapshot.decode("utf-8-sig").splitlines()
 
 
-def monitor(booking_executor, background):
+def main(hourly=False):
+    lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
+    booking_jobs = {}
+    ok = True
+    started = time.monotonic()
+    end = started + 3600
+    next_round = started
+    with ThreadPoolExecutor(max_workers=1) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
+        refresh = None
+        while True:
+            allow_booking = True
+            if refresh is not None:
+                try:
+                    lines = refresh.result()
+                except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+                    print(f"チェックリスト更新失敗。この回の自動申込を休止: {type(error).__name__}", flush=True)
+                    allow_booking = False
+                    ok = False
+            if hourly:
+                if time.monotonic() >= end:
+                    break
+                refresh = settings_executor.submit(fetch_checklist)
+            try:
+                with ExitStack() as background:
+                    if not monitor(booking_executor, background, booking_jobs, lines, allow_booking):
+                        ok = False
+            except (OSError, ValueError, RuntimeError) as error:
+                if not hourly:
+                    raise
+                ok = False
+                print(f"監視エラー: {type(error).__name__}: {error}", flush=True)
+            if not hourly:
+                break
+            next_round = max(next_round + 60, time.monotonic())
+            if next_round >= end:
+                break
+            time.sleep(max(0, next_round - time.monotonic()))
+
+        with timed_step("残りの申込完了待ち"):
+            for job in booking_jobs.values():
+                if not job.result():
+                    ok = False
+    if not ok:
+        sys.exit(1)
+
+
+def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
     today = datetime.now(JST).date()
 
     with timed_step("施設・注目設定読込"):
         targets = load_targets()
-        highlighted_ids = load_highlighted_ids(targets)
+        highlighted_ids = load_highlighted_ids(targets, lines)
     auto_bookings = {}
     auto_ok = True
 
     try:
         with timed_step("自動申込設定読込"):
-            auto_bookings = load_auto_bookings(targets)
+            auto_bookings = load_auto_bookings(targets, lines) if allow_booking else {}
 
         if auto_bookings and os.environ.get("GITHUB_ACTIONS") != "true":
             auto_bookings = {}
@@ -825,7 +865,10 @@ def monitor(booking_executor, background):
     baseline_count = 0
     months_to_scan = target_months(today)
     jobs = {}
-    booking_jobs = []
+    for key, job in list(booking_jobs.items()):
+        if job.done() and not job.result():
+            auto_ok = False
+            del booking_jobs[key]
     booking_lock = threading.Lock()
     submitted = set()
     recheck_jobs = []
@@ -842,11 +885,11 @@ def monitor(booking_executor, background):
         detected_at = time.perf_counter()
         with booking_lock:
             key = (facility_id, day)
-            if key in submitted:
+            if key in submitted or key in booking_jobs:
                 return
             submitted.add(key)
             print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
-            booking_jobs.append(booking_executor.submit(run_auto_booking, facility_id, day, detected_at))
+            booking_jobs[key] = booking_executor.submit(run_auto_booking, facility_id, day, detected_at)
 
     active_days = {
         facility_id: sorted(day.isoformat() for day in days if day >= today)
@@ -1013,16 +1056,10 @@ def monitor(booking_executor, background):
                 if not job.result():
                     auto_ok = False
 
-    with timed_step("残りの申込完了待ち"):
-        for job in booking_jobs:
-            if not job.result():
-                auto_ok = False
-
-    if failures or notification_error or not auto_ok:
-        sys.exit(1)
+    return not (failures or notification_error or not auto_ok)
 
 
 if __name__ == "__main__":
     log_duration("初期読込", SCRIPT_START, time.perf_counter())
     with timed_step("監視全体"):
-        main()
+        main(hourly="--hourly" in sys.argv[1:])
