@@ -17,7 +17,10 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from bs4 import BeautifulSoup
 
-from booking_ledger import BookingLedger
+from booking_ledger import (
+    BookingLedger, BookingAccessPaused, BOOKING_FAILED, BOOKING_RETRY,
+    BOOKING_PAUSED, check_booking_access, check_site_status, pause_booking,
+)
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
 TIMEOUT = (10, 30)
@@ -59,6 +62,39 @@ def parse_args():
 
 class BookingFlowError(RuntimeError):
     """A fixed diagnostic that is safe to print in Actions."""
+
+
+class RetryableBookingError(BookingFlowError):
+    pass
+
+
+class BookingSession(requests.Session):
+    def request(self, *args, **kwargs):
+        check_booking_access()
+        response = super().request(*args, **kwargs)
+        check_site_status(response.status_code, response.headers.get("Retry-After"))
+        return response
+
+
+def check_challenge(page):
+    if page.select_one(
+        'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
+        'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
+    ) or "人間であることを確認" in page.get_text(" ", strip=True):
+        pause_booking()
+        raise BookingAccessPaused("本人確認画面が表示されました。手動で確認してください")
+
+
+@contextmanager
+def retryable_search_request():
+    try:
+        yield
+    except (requests.Timeout, requests.ConnectionError):
+        raise RetryableBookingError("部屋選択前の一時的な通信エラー") from None
+    except requests.HTTPError as error:
+        if error.response is not None and error.response.status_code in (502, 504):
+            raise RetryableBookingError("部屋選択前の一時的なサーバーエラー") from None
+        raise
 
 
 def fail(message):
@@ -178,7 +214,7 @@ def submit_email(session, page, current_url, email):
 
 
 def main():
-    with timed_step("引数・日付確認"):
+    with timed_step('引数・日付確認'):
         args = parse_args()
         if date.fromisoformat(args.date).isoformat() != args.date:
             fail("宿泊日は YYYY-MM-DD で指定してください")
@@ -188,7 +224,7 @@ def main():
 
     ledger = None
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        with timed_step("申込履歴確認"):
+        with timed_step('申込履歴確認'):
             ledger = BookingLedger(args.facility_id, args.date)
             status = ledger.existing_status()
         if status == "pending":
@@ -210,7 +246,7 @@ def main():
     if sum(room_persons) != args.persons:
         fail("The room guest counts must add up to --persons")
 
-    with timed_step("施設設定読込"):
+    with timed_step('施設設定読込'):
         target, apply_url = get_apply_target(args.facility_id)
     finish_enabled = args.finish_from_gmail
     if finish_enabled and ledger is None:
@@ -222,13 +258,14 @@ def main():
         if (args.nights, args.persons, args.rooms, room_persons) != (1, 2, 1, [2]):
             fail("Gmailによる自動確定は1泊・2名・1室のみ対応します")
 
-    session = requests.Session()
+    session = BookingSession()
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ja,en-US;q=0.8,en;q=0.7"})
-    with timed_step("申込フォーム GET"):
+    with timed_step('申込フォーム GET'), retryable_search_request():
         response = session.get(apply_url, timeout=TIMEOUT)
         response.raise_for_status()
-    with timed_step("フォーム解析・検索条件準備"):
+    with timed_step('フォーム解析・検索条件準備'):
         page = BeautifulSoup(response.text, "lxml")
+        check_challenge(page)
         form = page.select_one("form#new_apply")
         csrf_meta = page.select_one('meta[name="csrf-token"]')
         csrf_token = csrf_meta.get("content") if csrf_meta else ""
@@ -255,7 +292,7 @@ def main():
         if not token_match:
             fail("空き検索用のページ情報を特定できません")
         search_url = booking_url(response.url, "empty_new?s=" + token_match.group(1))
-    with timed_step("部屋検索 POST"):
+    with timed_step('部屋検索 POST'), retryable_search_request():
         search_response = session.post(
             search_url,
             data=form_data,
@@ -269,13 +306,14 @@ def main():
             timeout=TIMEOUT,
         )
         search_response.raise_for_status()
-    with timed_step("検索結果解析・選択欄確認"):
+    with timed_step('検索結果解析・選択欄確認'):
         html_match = re.search(
             r"""\$\('#coma'\)\.html\(""",
             search_response.text
         )
 
         if not html_match:
+            check_challenge(BeautifulSoup(search_response.text, "lxml"))
             fail("空室一覧を含むJavaScriptレスポンスが見つかりません")
 
         js_literal = search_response.text[html_match.end():].lstrip()
@@ -287,16 +325,23 @@ def main():
         except json.JSONDecodeError as error:
             fail(f"検索結果のHTMLを取り出せません: {error}")
 
+        if not isinstance(html_fragment, str):
+            fail("検索結果のHTML形式が正しくありません")
         results = BeautifulSoup(html_fragment, "lxml")
+        check_challenge(results)
 
         checkboxes = results.select(
             "#coma_search_result input[type='checkbox'][name^='apply[coma[']"
         )
 
         if not checkboxes:
-            fail("空室検索結果にチェックボックスがありません")
+            print(f"検索結果診断: 一覧={bool(results.select_one('#coma_search_result'))} "
+                  f"全チェックボックス数={len(results.select('input[type=checkbox]'))}", flush=True)
+            if not results.select("input[type=checkbox]"):
+                raise RetryableBookingError("空室検索結果にチェックボックスがありません")
+            fail("空室検索結果にチェックボックスがありません。画面構造を確認してください")
 
-    with timed_step("部屋選択・送信準備"):
+    with timed_step('部屋選択・送信準備'):
         rows = []
         for checkbox in checkboxes:
             row = checkbox.find_parent("tr")
@@ -340,12 +385,13 @@ def main():
         form_data[session_guid["name"]] = session_guid.get("value", "")
 
         create_url = booking_url(response.url, form.get("action", ""))
-    with timed_step("申込前の履歴記録"):
+    with timed_step('申込前の履歴記録'):
+        check_booking_access()
         sha = ledger.write("pending") if ledger else None
     try:
         since_ms = request_confirmation_email(session, create_url, form_data, args.email)
         if ledger:
-            with timed_step("メール送信済み記録"):
+            with timed_step('メール送信済み記録'):
                 sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
     except Exception as error:
         raise RuntimeError(
@@ -358,7 +404,7 @@ def main():
         return
 
     try:
-        with timed_step("Gmail認証準備"):
+        with timed_step('Gmail認証準備'):
             oauth, profile = config_from_env()
             headers = gmail_headers(oauth, args.email)
     except Exception as error:
@@ -373,11 +419,11 @@ def main():
         sha = ledger.write("finalizing", sha)
 
     try:
-        with timed_step("受付メール照合・最終申込"):
+        with timed_step('受付メール照合・最終申込'):
             final_submission(
                 headers, profile, since_ms, args.date, booking_name, mark_finalizing
             )
-        with timed_step("受付済み記録"):
+        with timed_step('受付済み記録'):
             ledger.write("accepted", sha)
     except Exception as error:
         # HTTP exceptions can include the booking URL. Keep it out of Action logs.
@@ -435,7 +481,7 @@ def booking_step(label, operation, *args):
 
 def request_confirmation_email(session, create_url, form_data, email):
     print("部屋選択リクエストを送信します", flush=True)
-    with timed_step("部屋選択 POST"):
+    with timed_step('部屋選択 POST'):
         final = session.post(create_url, data=form_data, timeout=TIMEOUT, allow_redirects=True)
         final.raise_for_status()
     final_page = BeautifulSoup(final.text, "lxml")
@@ -443,7 +489,7 @@ def request_confirmation_email(session, create_url, form_data, email):
         fail("施設側で申込エラーになりました。部屋は選択されていない可能性があります")
     if "/apply/rule" in final.url or "個人情報の取り扱い" in final_page.get_text(" ", strip=True):
         print("同意画面を確認しました", flush=True)
-        with timed_step("同意送信"):
+        with timed_step('同意送信'):
             final = booking_step("同意操作", submit_consent, session, final_page, final.url)
         final_page = BeautifulSoup(final.text, "lxml")
 
@@ -455,7 +501,7 @@ def request_confirmation_email(session, create_url, form_data, email):
 
     since_ms = time.time_ns() // 1_000_000
     print("メール入力画面を確認しました", flush=True)
-    with timed_step("確認メール送信"):
+    with timed_step('確認メール送信'):
         sent = booking_step("メール送信", submit_email, session, final_page, final.url, email)
     sent_path = urlsplit(booking_url(sent.url, "")).path.rstrip("/")
     response_page = BeautifulSoup(sent.text, "lxml")
@@ -484,9 +530,15 @@ if __name__ == "__main__":
         print(f"[申込計測] {label} {elapsed * 1000:.1f} ms", flush=True)
     try:
         main()
+    except RetryableBookingError as error:
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        sys.exit(BOOKING_RETRY)
+    except BookingAccessPaused as error:
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        sys.exit(BOOKING_PAUSED)
     except Exception as error:
         detail = "通信またはHTTPエラー" if isinstance(error, requests.RequestException) else str(error)
         print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(BOOKING_FAILED)
     finally:
         print(f"[計測] 申込スクリプト合計 {(time.perf_counter() - SCRIPT_START) * 1000:.1f} ms", flush=True)
