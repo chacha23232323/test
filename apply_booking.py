@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -26,6 +27,25 @@ from booking_ledger import (
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
 TIMEOUT = (10, 30)
+_metric_lines = []
+
+
+def queue_metric(message):
+    _metric_lines.append(message)
+
+
+def flush_metrics():
+    if _metric_lines:
+        print("\n".join(_metric_lines), flush=True)
+        _metric_lines.clear()
+
+
+def handle_termination(signum, frame):
+    try:
+        flush_metrics()
+    finally:
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
 
 
 @contextmanager
@@ -40,12 +60,13 @@ def timed_step(label):
     finally:
         end = time.perf_counter()
         key = os.environ.get("BOOKING_TIMING_KEY", "")
-        print(
+        queue_metric(
             f"[申込計測] {key} {label} | {outcome} | 所要 {(end - start) * 1000:.1f} ms"
             f" | スクリプト開始から {(start - SCRIPT_START) * 1000:.1f}"
-            f" → {(end - SCRIPT_START) * 1000:.1f} ms",
-            flush=True,
+            f" → {(end - SCRIPT_START) * 1000:.1f} ms"
         )
+        if outcome == "中断":
+            flush_metrics()
 
 
 def parse_args():
@@ -72,9 +93,14 @@ class RetryableBookingError(BookingFlowError):
 
 class BookingSession(requests.Session):
     def request(self, *args, **kwargs):
-        check_booking_access()
-        response = super().request(*args, **kwargs)
-        check_site_status(response.status_code, response.headers.get("Retry-After"))
+        try:
+            check_booking_access()
+            response = super().request(*args, **kwargs)
+            check_site_status(response.status_code, response.headers.get("Retry-After"))
+        except (BookingAccessDenied, BookingAccessPaused) as error:
+            print(f"{type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            flush_metrics()
+            raise
         return response
 
 
@@ -389,7 +415,7 @@ def run_booking(args):
             )
         )[0]
 
-        print(f"選択: 部屋番号 {chosen[0]} / {chosen[3][3]} / 定員 {chosen[3][4]} / {chosen[3][5]}")
+        queue_metric(f"選択: 部屋番号 {chosen[0]} / {chosen[3][3]} / 定員 {chosen[3][4]} / {chosen[3][5]}")
         # Only 1 room is advanced automatically until multi-room result semantics are confirmed.
         if args.rooms != 1:
             fail("現在の実装は1室の選択までです。複数室では部屋割りと連泊の対応を追加してください")
@@ -413,6 +439,8 @@ def run_booking(args):
             sha = ledger.write("pending") if ledger else None
     try:
         since_ms = request_confirmation_email(session, create_url, form_data, args.email)
+        flush_metrics()
+        print(f"部屋番号 {chosen[0]} の確認メール送信完了画面を確認しました。", flush=True)
         if ledger:
             with timed_step('メール送信済み記録'):
                 if fast:
@@ -423,6 +451,7 @@ def run_booking(args):
                 else:
                     sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
     except Exception as error:
+        flush_metrics()
         if fast:
             try:
                 with timed_step('異常時の申込履歴復旧'):
@@ -433,7 +462,6 @@ def run_booking(args):
             f"部屋選択以降の結果を確定できません。詳細: {booking_failure_detail(error)}。"
             "再実行する前に確認メールと申込状況を確認してください。"
         ) from None
-    print(f"部屋番号 {chosen[0]} の確認メール送信完了画面を確認しました。")
     if not finish_enabled:
         print("確認メール内のURLを開いて申込を完了してください。")
         return
@@ -522,7 +550,9 @@ def request_confirmation_email(session, create_url, form_data, email):
     final_page = BeautifulSoup(final.text, "lxml")
     if "申込データにエラー" in final_page.get_text(" ", strip=True):
         fail("施設側で申込エラーになりました。部屋は選択されていない可能性があります")
-    if "/apply/rule" in final.url or "個人情報の取り扱い" in final_page.get_text(" ", strip=True):
+    rule_confirmed = "/apply/rule" in final.url or "個人情報の取り扱い" in final_page.get_text(" ", strip=True)
+    if rule_confirmed:
+        flush_metrics()
         print("同意画面を確認しました", flush=True)
         with timed_step('同意送信'):
             final = booking_step("同意操作", submit_consent, session, final_page, final.url)
@@ -534,6 +564,8 @@ def request_confirmation_email(session, create_url, form_data, email):
     if "/apply/email_input" not in final.url and not final_page.select_one("input[name='email']"):
         fail("同意後のメール入力画面を確認できませんでした")
 
+    if not rule_confirmed:
+        flush_metrics()
     since_ms = time.time_ns() // 1_000_000
     print("メール入力画面を確認しました", flush=True)
     with timed_step('確認メール送信'):
@@ -553,31 +585,33 @@ def request_confirmation_email(session, create_url, form_data, email):
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_termination)
     loaded = time.perf_counter()
     origin = datetime.fromtimestamp(START_UTC, timezone.utc).isoformat(timespec="milliseconds")
-    print(f"[計測] スクリプト開始 {origin} | 初期読込 {(loaded - SCRIPT_START) * 1000:.1f} ms", flush=True)
+    queue_metric(f"[計測] スクリプト開始 {origin} | 初期読込 {(loaded - SCRIPT_START) * 1000:.1f} ms")
     for variable, label in (("BOOKING_DETECTED_AT", "検知からスクリプト開始"),
                             ("BOOKING_LAUNCHED_AT", "子プロセス起動からスクリプト開始")):
         try:
             elapsed = SCRIPT_START - float(os.environ[variable])
         except (ValueError, KeyError):
             continue
-        print(f"[申込計測] {label} {elapsed * 1000:.1f} ms", flush=True)
+        queue_metric(f"[申込計測] {label} {elapsed * 1000:.1f} ms")
     try:
         main()
     except RetryableBookingError as error:
-        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         sys.exit(BOOKING_RETRY)
     except BookingAccessDenied as error:
-        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         sys.exit(BOOKING_PAUSED)
     except BookingAccessPaused as error:
         # Only pre-ledger failures can reach this handler; later errors stay terminal.
-        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         sys.exit(BOOKING_DEFERRED)
     except Exception as error:
         detail = "通信またはHTTPエラー" if isinstance(error, requests.RequestException) else str(error)
-        print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr)
+        print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr, flush=True)
         sys.exit(BOOKING_FAILED)
     finally:
-        print(f"[計測] 申込スクリプト合計 {(time.perf_counter() - SCRIPT_START) * 1000:.1f} ms", flush=True)
+        queue_metric(f"[計測] 申込スクリプト合計 {(time.perf_counter() - SCRIPT_START) * 1000:.1f} ms")
+        flush_metrics()
