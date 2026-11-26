@@ -21,7 +21,7 @@ import requests
 from bs4 import BeautifulSoup, NavigableString
 from booking_ledger import (
     MAX_BROWSER_WORKERS, local_slots, lock_root, check_booking_access,
-    check_site_status, pause_booking,
+    check_site_status, BookingAccessDenied,
 )
 
 SUBJECT_SUFFIX = "申込手続きのご案内"
@@ -134,8 +134,7 @@ def site_page(response, expected_path):
         'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
         'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
     ) or "人間であることを確認" in page.get_text(" ", strip=True):
-        pause_booking()
-        raise RuntimeError("本人確認画面が表示されました。案内メールから手動で進めてください")
+        raise BookingAccessDenied("本人確認画面が表示されました。案内メールから手動で進めてください")
     return page
 
 
