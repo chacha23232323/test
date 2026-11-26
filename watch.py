@@ -21,7 +21,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from lxml import html as lxml_html
 from booking_ledger import (
-    BOOKING_OK, BOOKING_FAILED, BOOKING_RETRY, BOOKING_PAUSED,
+    BOOKING_OK, BOOKING_FAILED, BOOKING_RETRY, BOOKING_PAUSED, BOOKING_DEFERRED,
+    BookingAccessDenied, BookingAccessPaused, cooldown_remaining,
     booking_paused, check_booking_access, check_site_status,
 )
 
@@ -43,6 +44,8 @@ COLOR_STANDARD = 0x3498DB
 
 _thread_local = threading.local()
 _discord_session = None
+_denied_urls = set()
+_denied_urls_lock = threading.Lock()
 
 DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
 
@@ -291,7 +294,7 @@ def load_auto_bookings(targets, lines):
 
 def run_auto_booking(facility_id, day, detected_at):
     if booking_paused():
-        return BOOKING_PAUSED
+        return BOOKING_DEFERRED
     key = f"{facility_id} {day}"
     log_duration("申込ワーカー待ち " + key, detected_at, time.perf_counter())
     print(f"自動申込確認: {facility_id} {day}", flush=True)
@@ -319,8 +322,8 @@ def run_auto_booking(facility_id, day, detected_at):
         if error.returncode == BOOKING_RETRY:
             print(f"自動申込の再確認対象: {key}", flush=True)
             return BOOKING_RETRY
-        if error.returncode == BOOKING_PAUSED:
-            return BOOKING_PAUSED
+        if error.returncode in (BOOKING_PAUSED, BOOKING_DEFERRED):
+            return error.returncode
         print(f"自動申込を確認できませんでした: {key} (終了コード {error.returncode})", flush=True)
         return BOOKING_FAILED
     except (subprocess.SubprocessError, OSError) as error:
@@ -382,11 +385,19 @@ def target_months(today):
 
 def fetch_html(url):
     check_booking_access()
+    with _denied_urls_lock:
+        if url in _denied_urls:
+            raise BookingAccessDenied("HTTP 403 を受けたカレンダーの再取得を見送ります")
     with get_session().get(
         url,
         timeout=REQUEST_TIMEOUT,
     ) as response:
-        check_site_status(response.status_code, response.headers.get("Retry-After"))
+        try:
+            check_site_status(response.status_code, response.headers.get("Retry-After"))
+        except BookingAccessDenied:
+            with _denied_urls_lock:
+                _denied_urls.add(url)
+            raise
         response.raise_for_status()
         response.encoding = "utf-8"
         return response.text
@@ -701,14 +712,15 @@ class BookingRound:
         self.lock = threading.Lock()
 
     def _state(self, key):
-        if booking_paused() or self.attempts.get(key, 0) >= MAX_BOOKING_ATTEMPTS:
+        if self.attempts.get(key, 0) >= MAX_BOOKING_ATTEMPTS:
             return "stop"
         job = self.jobs.get(key)
-        if job is None:
-            return "ready"
-        if not job.done():
-            return "wait"
-        return "ready" if job.result() == BOOKING_RETRY else "stop"
+        if job is not None:
+            if not job.done():
+                return "wait"
+            if job.result() not in (BOOKING_RETRY, BOOKING_DEFERRED):
+                return "stop"
+        return "wait" if booking_paused() else "ready"
 
     def state(self, facility_id, day):
         with self.lock:
@@ -758,6 +770,12 @@ def recheck_month(target_id, year, month, url, days, started, booking_round, req
             for day in sorted(ready):
                 if current.get(day) in ("○", "△"):
                     booking_round.submit(target_id, day)
+        except BookingAccessDenied as error:
+            print(f"追加確認中止 {label}: {error}", flush=True)
+            return False
+        except BookingAccessPaused as error:
+            print(f"追加確認休止 {label}: {error}", flush=True)
+            had_error = True
         except Exception as error:
             print(f"追加確認失敗 {label} +{offset}秒 ({type(error).__name__})", flush=True)
             had_error = True
@@ -844,6 +862,8 @@ def fetch_checklist():
 
 
 def main(hourly=False):
+    with _denied_urls_lock:
+        _denied_urls.clear()
     with tempfile.TemporaryDirectory(prefix="its-booking-run-") as directory:
         previous = os.environ.get("BOOKING_PAUSE_FILE")
         os.environ["BOOKING_PAUSE_FILE"] = str(Path(directory) / "paused")
@@ -866,9 +886,21 @@ def run_monitor(hourly=False):
     with ThreadPoolExecutor(max_workers=MAX_BOOKING_WORKERS) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
         refresh = None
         while True:
-            if booking_paused():
-                ok = False
+            if hourly and time.monotonic() >= end:
                 break
+            remaining = cooldown_remaining()
+            if remaining > 0:
+                if not hourly:
+                    ok = False
+                    break
+                wait = min(remaining, max(0.0, end - time.monotonic()))
+                print(f"施設アクセス休止: 約 {wait:.1f} 秒待機します", flush=True)
+                time.sleep(wait)
+                # Re-read the shared deadline because another in-flight request may extend it.
+                if not booking_paused() and time.monotonic() < end:
+                    print("施設アクセス休止解除: 監視を再開します", flush=True)
+                    next_round = time.monotonic()
+                continue
             allow_booking = True
             if refresh is not None:
                 try:
@@ -890,11 +922,10 @@ def run_monitor(hourly=False):
                     raise
                 ok = False
                 print(f"監視エラー: {type(error).__name__}: {error}", flush=True)
-            if booking_paused():
-                ok = False
-                break
             if not hourly:
                 break
+            if booking_paused():
+                continue
             next_round = max(next_round + 60, time.monotonic())
             if next_round >= end:
                 break
@@ -941,8 +972,9 @@ def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
     months_to_scan = target_months(today)
     jobs = {}
     for key, job in list(booking_jobs.items()):
-        if job.done() and job.result() == BOOKING_RETRY:
-            auto_ok = False
+        if job.done() and job.result() in (BOOKING_RETRY, BOOKING_DEFERRED):
+            if job.result() == BOOKING_RETRY:
+                auto_ok = False
             del booking_jobs[key]
     booking_lock = threading.Lock()
     booking_round = BookingRound(booking_executor, booking_jobs)
