@@ -18,8 +18,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from booking_ledger import (
-    BookingLedger, BookingAccessPaused, BOOKING_FAILED, BOOKING_RETRY,
-    BOOKING_PAUSED, check_booking_access, check_site_status, pause_booking,
+    BookingLedger, BookingAccessPaused, BookingAccessDenied, BOOKING_FAILED, BOOKING_RETRY,
+    BOOKING_PAUSED, BOOKING_DEFERRED, check_booking_access, check_site_status,
 )
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
@@ -81,8 +81,7 @@ def check_challenge(page):
         'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
         'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
     ) or "人間であることを確認" in page.get_text(" ", strip=True):
-        pause_booking()
-        raise BookingAccessPaused("本人確認画面が表示されました。手動で確認してください")
+        raise BookingAccessDenied("本人確認画面が表示されました。手動で確認してください")
 
 
 @contextmanager
@@ -533,9 +532,13 @@ if __name__ == "__main__":
     except RetryableBookingError as error:
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         sys.exit(BOOKING_RETRY)
-    except BookingAccessPaused as error:
+    except BookingAccessDenied as error:
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         sys.exit(BOOKING_PAUSED)
+    except BookingAccessPaused as error:
+        # Only pre-ledger failures can reach this handler; later errors stay terminal.
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
+        sys.exit(BOOKING_DEFERRED)
     except Exception as error:
         detail = "通信またはHTTPエラー" if isinstance(error, requests.RequestException) else str(error)
         print(f"ERROR: {type(error).__name__}: {detail}", file=sys.stderr)
