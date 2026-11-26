@@ -1,11 +1,14 @@
 """Durable booking guard shared by automatic and manual GitHub Actions runs."""
 import base64
 import hashlib
+import math
 import json
 import os
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -14,6 +17,8 @@ BOOKING_OK = 0
 BOOKING_FAILED = 1
 BOOKING_RETRY = 75
 BOOKING_PAUSED = 76
+BOOKING_DEFERRED = 77
+DEFAULT_COOLDOWN = 60
 MAX_BROWSER_WORKERS = 3
 
 
@@ -21,26 +26,84 @@ class BookingAccessPaused(RuntimeError):
     pass
 
 
+class BookingAccessDenied(BookingAccessPaused):
+    pass
+
+
+def cooldown_deadline():
+    path = os.environ.get("BOOKING_PAUSE_FILE")
+    if not path:
+        return 0.0
+    try:
+        value = float(Path(path).read_text(encoding="ascii"))
+    except FileNotFoundError:
+        return 0.0
+    if not math.isfinite(value):
+        raise RuntimeError("アクセス休止記録が不正です")
+    return value
+
+
+def cooldown_remaining():
+    return max(0.0, cooldown_deadline() - time.time())
+
+
 def booking_paused():
-    path = os.environ.get("BOOKING_PAUSE_FILE")
-    return bool(path and Path(path).exists())
+    return cooldown_remaining() > 0
 
 
-def pause_booking():
+def retry_after_seconds(value, now):
+    if value:
+        value = str(value).strip()
+        if value.isascii() and value.isdecimal():
+            try:
+                seconds = float(value)
+                if math.isfinite(seconds):
+                    return max(1.0, seconds)
+            except (ValueError, OverflowError):
+                pass
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(1.0, when.timestamp() - now)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    return float(DEFAULT_COOLDOWN)
+
+
+def pause_booking(retry_after=None):
+    now = time.time()
+    seconds = retry_after_seconds(retry_after, now)
     path = os.environ.get("BOOKING_PAUSE_FILE")
-    if path:
-        Path(path).touch(exist_ok=True)
+    if not path:
+        return seconds
+    path = Path(path)
+    # Atomic publication under a cross-process lock; a shorter response cannot shorten an active pause.
+    with local_slots("site-cooldown", timeout=15):
+        deadline = max(cooldown_deadline(), now + seconds)
+        fd, temporary = tempfile.mkstemp(prefix="cooldown-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write(str(deadline))
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return max(0.0, deadline - time.time())
 
 
 def check_booking_access():
-    if booking_paused():
-        raise BookingAccessPaused("施設側のアクセス制限を検知したため、この実行の新規アクセスを停止します")
+    remaining = cooldown_remaining()
+    if remaining > 0:
+        raise BookingAccessPaused(f"施設側のアクセス制限により休止中 (残り約 {math.ceil(remaining)} 秒)")
 
 
 def check_site_status(status, retry_after=None):
-    if status in (403, 429) or (status == 503 and retry_after):
-        pause_booking()
-        raise BookingAccessPaused(f"施設側が HTTP {status} を返したため、この実行の新規アクセスを停止します")
+    if status == 403:
+        raise BookingAccessDenied("施設側が HTTP 403 を返しました。該当アクセスを中止します")
+    if status == 429 or (status == 503 and retry_after):
+        remaining = pause_booking(retry_after)
+        raise BookingAccessPaused(f"施設側が HTTP {status} を返しました。新規アクセスを約 {math.ceil(remaining)} 秒休止します")
 
 
 def lock_root():
