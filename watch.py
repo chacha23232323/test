@@ -1,9 +1,15 @@
+import time
+
+SCRIPT_START = time.perf_counter()
+
 import json
 import os
 import re
 import sys
+import subprocess
 import calendar
 import threading
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -11,33 +17,105 @@ from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from lxml import html as lxml_html
 
 STATE_PATH = Path("state.json")
+AUTO_BOOKING_SECTION = "## 自動申込チェックリスト"
 JST = ZoneInfo("Asia/Tokyo")
 
-# 同時アクセス数。まずは8件に抑えてサイトへの負荷を避ける
-MAX_WORKERS = 8
+MAX_WORKERS = 17
 REQUEST_TIMEOUT = (5, 25)
 
-_thread_local = threading.local()
+MAX_EMBEDS_PER_MESSAGE = 10
+MAX_EMBED_TOTAL_CHARS = 5800
+DISCORD_MAX_RETRIES = 5
 
+COLOR_HIGHLIGHTED = 0xE74C3C
+COLOR_STANDARD = 0x3498DB
+
+_thread_local = threading.local()
+_discord_session = None
+
+DAY_PATTERN = re.compile(r"^\s*(\d{1,2})\s*")
+
+WEEKDAY_MAP = {
+    "月": 0,
+    "火": 1,
+    "水": 2,
+    "木": 3,
+    "金": 4,
+    "土": 5,
+    "日": 6,
+}
+
+WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+def log_duration(label, start, end, result="完了"):
+    print(
+        f"[監視計測] {label} | {result} | 所要 {(end - start) * 1000:.1f} ms"
+        f" | 監視開始から {(start - SCRIPT_START) * 1000:.1f} → {(end - SCRIPT_START) * 1000:.1f} ms",
+        flush=True,
+    )
+
+@contextmanager
+def timed_step(label):
+    start = time.perf_counter()
+    try:
+        yield
+    except BaseException:
+        log_duration(label, start, time.perf_counter(), "中断")
+        raise
+    else:
+        log_duration(label, start, time.perf_counter())
 
 def get_session():
-    """スレッドごとにHTTPセッションを1つ用意して接続を再利用する"""
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
         })
+
+        adapter = HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=2,
+            max_retries=0,
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         _thread_local.session = session
+
     return _thread_local.session
 
+def get_discord_session():
+    global _discord_session
+
+    if _discord_session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+        })
+
+        adapter = HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0,
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _discord_session = session
+
+    return _discord_session
 
 def load_targets():
-    data = json.loads(Path("targets.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        Path("targets.json").read_text(encoding="utf-8")
+    )
     targets = data.get("targets", [])
+
     if not targets:
         raise RuntimeError("targets.json に対象施設がありません")
 
@@ -47,11 +125,204 @@ def load_targets():
                 f'{target.get("name", "不明な施設")} の所在地が未設定です'
             )
 
+        if not target.get("id"):
+            raise RuntimeError("施設IDが未設定です")
+
     return targets
 
+def parse_highlight_weekdays(label, line_number):
+    day_match = re.search(
+        r"[（(]([^（）()]*)[）)]\s*$",
+        label,
+    )
+
+    if not day_match:
+        return None
+
+    day_text = day_match.group(1).strip()
+
+    if day_text == "全曜日":
+        return None
+
+    normalized = re.sub(
+        r"[・、,，\s]+",
+        "",
+        day_text,
+    )
+
+    if not normalized:
+        raise RuntimeError(
+            f"highlight.md {line_number}行目の曜日指定が空です"
+        )
+
+    weekdays = set()
+
+    for character in normalized:
+        if character not in WEEKDAY_MAP:
+            raise RuntimeError(
+                f"highlight.md {line_number}行目の曜日指定が正しくありません: "
+                f"{day_text}"
+            )
+
+        weekdays.add(WEEKDAY_MAP[character])
+
+    return weekdays
+
+def load_highlighted_ids(targets, lines):
+    target_ids = [str(target["id"]) for target in targets]
+    valid_ids = set(target_ids)
+
+    if len(valid_ids) != len(target_ids):
+        raise RuntimeError("targets.json の施設IDが重複しています")
+
+    checkbox_pattern = re.compile(
+        r"^\s*-\s+\[(?P<checked>[ xX])\]\s+"
+        r"(?P<label>.*?)\s*"
+        r"<!--\s*(?P<id>[A-Za-z0-9_-]+)\s*-->\s*$"
+    )
+
+    seen_ids = set()
+    highlighted_ids = {}
+
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+
+        if stripped == AUTO_BOOKING_SECTION:
+            break
+        if not stripped.startswith("- ["):
+            continue
+
+        match = checkbox_pattern.fullmatch(line)
+
+        if not match:
+            raise RuntimeError(
+                f"highlight.md {line_number}行目のチェックボックス形式が正しくありません"
+            )
+
+        target_id = match.group("id")
+
+        if target_id in seen_ids:
+            raise RuntimeError(
+                f"highlight.md に施設IDが重複しています: {target_id}"
+            )
+
+        seen_ids.add(target_id)
+
+        if match.group("checked").lower() == "x":
+            if target_id not in valid_ids:
+                raise RuntimeError(
+                    f"highlight.md の注目施設IDがtargets.jsonにありません: {target_id}"
+                )
+
+            label = match.group("label").strip()
+
+            weekdays = parse_highlight_weekdays(
+                label,
+                line_number,
+            )
+
+            highlighted_ids[target_id] = weekdays
+
+    return highlighted_ids
+
+def load_auto_bookings(targets, lines):
+    valid_ids = {str(target["id"]) for target in targets}
+    sections = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == AUTO_BOOKING_SECTION
+    ]
+
+    if not sections:
+        return {}
+
+    if len(sections) > 1:
+        raise ValueError("自動申込チェックリストの見出しが重複しています")
+
+    pattern = re.compile(
+        r"-\s+\[([ xX])\]\s+([A-Za-z0-9_-]+)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})"
+    )
+    bookings = {}
+
+    for line_number, line in enumerate(lines[sections[0] + 1:], sections[0] + 2):
+        line = line.strip()
+
+        if line.startswith("#"):
+            break
+        if not line.startswith("- ["):
+            continue
+
+        match = pattern.fullmatch(line)
+        if not match:
+            raise ValueError(
+                f"highlight.md {line_number}行目の自動申込欄の書式が正しくありません"
+            )
+
+        checked, facility_id, day = match.groups()
+        stay_date = date.fromisoformat(day)
+
+        if checked.lower() != "x":
+            continue
+
+        if facility_id not in valid_ids:
+            raise ValueError(
+                f"highlight.md {line_number}行目の自動申込施設IDが targets.json にありません"
+            )
+
+        bookings.setdefault(facility_id, set()).add(stay_date)
+
+    return bookings
+
+def run_auto_booking(facility_id, day, detected_at):
+    key = f"{facility_id} {day}"
+    log_duration("申込ワーカー待ち " + key, detected_at, time.perf_counter())
+    print(f"自動申込確認: {facility_id} {day}", flush=True)
+
+    try:
+        with timed_step("申込子プロセス全体 " + key):
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("apply_booking.py")),
+                    "--facility-id", facility_id,
+                    "--date", day,
+                    "--nights", "1",
+                    "--persons", "2",
+                    "--rooms", "1",
+                    "--room-persons", "2",
+                    "--finish-from-gmail",
+                ],
+                env={**os.environ, "BOOKING_DETECTED_AT": str(detected_at),
+                     "BOOKING_LAUNCHED_AT": str(time.perf_counter()), "BOOKING_TIMING_KEY": key},
+                check=True,
+                timeout=270,
+            )
+    except (subprocess.SubprocessError, OSError) as error:
+        print(
+            f"自動申込を確認できませんでした: "
+            f"{facility_id} {day} ({type(error).__name__})"
+        )
+        return False
+    return True
+
+def is_highlighted_entry(entry, highlighted_ids):
+    target_id = str(entry["target_id"])
+
+    if target_id not in highlighted_ids:
+        return False
+
+    weekdays = highlighted_ids[target_id]
+
+    if weekdays is None:
+        return True
+
+    entry_weekday = date.fromisoformat(
+        entry["day"]
+    ).weekday()
+
+    return entry_weekday in weekdays
 
 def make_month_url(original_url, year, month, base_date):
-    """施設固有のURL情報を維持し、join_dateの年月を変更する"""
     last_day = calendar.monthrange(year, month)[1]
     day = min(base_date.day, last_day)
     new_date = date(year, month, day).isoformat()
@@ -68,32 +339,48 @@ def make_month_url(original_url, year, month, base_date):
         parts.fragment,
     ))
 
-
 def target_months(today):
-    """当月・翌月・翌々月を返す"""
     result = []
+
     for offset in range(3):
         month_index = today.year * 12 + today.month - 1 + offset
         year = month_index // 12
         month = month_index % 12 + 1
         result.append((year, month))
+
     return result
 
-
 def fetch_html(url):
-    response = get_session().get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding
-    return response.text
-
+    with get_session().get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+        response.raise_for_status()
+        response.encoding = "utf-8"
+        return response.text
 
 def detect_daily_statuses(html, year, month):
-    soup = BeautifulSoup(html, "html.parser")
+    if not html or not html.strip():
+        return {}
+
+    document = lxml_html.fromstring(html)
+
+    cells = document.xpath(
+        "//td[contains(concat(' ', normalize-space(@class), ' '), ' empty ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' a_little ')]"
+    )
+
     results = {}
 
-    for cell in soup.select("td.empty, td.a_little"):
-        value = cell.get_text(" ", strip=True)
-        match = re.match(r"^\s*(\d{1,2})\s*", value)
+    for cell in cells:
+        value = " ".join(
+            part.strip()
+            for part in cell.itertext()
+            if part.strip()
+        )
+
+        match = DAY_PATTERN.match(value)
+
         if not match:
             continue
 
@@ -104,7 +391,7 @@ def detect_daily_statuses(html, year, month):
         except ValueError:
             continue
 
-        classes = cell.get("class", [])
+        classes = (cell.get("class") or "").split()
 
         if "a_little" in classes:
             results[calendar_date.isoformat()] = "△"
@@ -113,111 +400,296 @@ def detect_daily_statuses(html, year, month):
 
     return results
 
-
 def load_state():
     if not STATE_PATH.exists():
         return {}
 
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(
+            STATE_PATH.read_text(encoding="utf-8")
+        )
     except json.JSONDecodeError:
         raise RuntimeError(
             "state.json が壊れています。安全のため停止します"
-        )
-
+        ) from None
 
 def save_state(state):
-    STATE_PATH.write_text(
+    temp_path = STATE_PATH.with_suffix(".tmp")
+
+    temp_path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
+    os.replace(temp_path, STATE_PATH)
 
-def line_push(message):
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    user = os.environ.get("LINE_USER_ID", "").strip()
+def discord_webhook(messages):
+    webhook_url = os.environ.get(
+        "DISCORD_WEBHOOK_URL", ""
+    ).strip()
 
-    if not token or not user:
-        raise RuntimeError(
-            "LINE_CHANNEL_ACCESS_TOKEN または LINE_USER_ID が未設定です"
-        )
+    if not webhook_url:
+        raise RuntimeError("DISCORD_WEBHOOK_URL が未設定です")
 
-    if len(message) > 4900:
-        raise RuntimeError(
-            f"LINE通知が長すぎます（{len(message)}文字）。通知は送信していません"
-        )
+    session = get_discord_session()
 
-    response = requests.post(
-        "https://api.line.me/v2/bot/message/push",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "to": user,
-            "messages": [{"type": "text", "text": message}],
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    for message in messages:
+        embeds = message.get("embeds", [])
 
+        if not embeds:
+            continue
+
+        if len(embeds) > MAX_EMBEDS_PER_MESSAGE:
+            raise RuntimeError(
+                "DiscordのEmbed数上限を超えています"
+            )
+
+        payload = {
+            "embeds": embeds
+        }
+
+        for attempt in range(DISCORD_MAX_RETRIES + 1):
+            try:
+                with session.post(
+                    webhook_url,
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT,
+                ) as response:
+
+                    if response.status_code == 429:
+                        if attempt >= DISCORD_MAX_RETRIES:
+                            raise RuntimeError(
+                                f"Discord送信に失敗しました "
+                                f"(HTTP 429、再試行上限{DISCORD_MAX_RETRIES}回)"
+                            )
+
+                        retry_after = None
+
+                        try:
+                            retry_after = float(
+                                response.json().get("retry_after")
+                            )
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+
+                        if retry_after is None:
+                            try:
+                                retry_after = float(
+                                    response.headers.get(
+                                        "Retry-After",
+                                        "1",
+                                    )
+                                )
+                            except (ValueError, TypeError):
+                                retry_after = 1.0
+
+                        wait_time = max(
+                            0.0,
+                            min(retry_after, 60.0),
+                        )
+
+                        with timed_step("Discord 429 再試行待ち"):
+                            time.sleep(wait_time)
+                        continue
+
+                    if not 200 <= response.status_code < 300:
+                        error_text = response.text[:500]
+
+                        raise RuntimeError(
+                            f"Discord送信に失敗しました "
+                            f"(HTTP {response.status_code}: "
+                            f"{error_text})"
+                        )
+
+                    break
+
+            except requests.RequestException as error:
+                raise RuntimeError(
+                    f"Discord送信中に通信エラーが発生しました "
+                    f"({type(error).__name__}: {error})"
+                ) from error
 
 def format_japanese_date(day_text):
     day = date.fromisoformat(day_text)
-    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
 
     return (
         f"{day.year}年{day.month}月{day.day}日"
-        f"（{weekdays[day.weekday()]}）"
+        f"（{WEEKDAYS_JA[day.weekday()]}）"
     )
 
-
-def format_notice(title, entries):
-    """施設・所在地・対象月ごとにまとめ、月別カレンダーURLを付ける"""
-    lines = [title, ""]
-
+def build_notice_blocks(entries, max_block_chars=3800):
     grouped = {}
 
     for entry in entries:
         day = date.fromisoformat(entry["day"])
-        month_key = (entry["name"], day.year, day.month)
+        target_id = str(entry["target_id"])
+        group_key = (target_id, entry["name"], day.year, day.month)
 
-        if month_key not in grouped:
-            grouped[month_key] = {
+        if group_key not in grouped:
+            grouped[group_key] = {
                 "location": entry["location"],
                 "url": entry["url"],
-                "nights": entry["nights"],
+                "trip_purpose": entry.get("trip_purpose", ""),
+                "bike_trip": entry.get("bike_trip", ""),
                 "entries": [],
             }
 
-        grouped[month_key]["entries"].append(entry)
+        grouped[group_key]["entries"].append(entry)
 
-    for (name, year, month), group in sorted(grouped.items()):
-        lines.append(f"■ {name}")
-        lines.append(f'📍 {group["location"]}')
-        lines.append(f"【{year}年{month}月】")
+    blocks = []
 
-        for entry in sorted(
-            group["entries"],
-            key=lambda x: x["day"],
-        ):
-            lines.append(
-                f'・{format_japanese_date(entry["day"])} '
-                f'{entry["status"]}｜{entry["nights"]}泊'
+    for group_key, group in sorted(grouped.items()):
+        target_id, facility_name, year, month = group_key
+        tag = (target_id, f"{year:04d}-{month:02d}")
+
+        sorted_entries = sorted(group["entries"], key=lambda entry: entry["day"])
+        month_heading = []
+        if len(sorted_entries) > 1:
+            month_heading.append(f"> **📅 {year}年{month}月**")
+
+        daily_lines = []
+
+        for entry in sorted_entries:
+            if month_heading:
+                day = date.fromisoformat(entry["day"])
+                date_label = f"{day.day}日（{WEEKDAYS_JA[day.weekday()]}）"
+            else:
+                date_label = f'📅 {format_japanese_date(entry["day"])}'
+
+            daily_lines.append(
+                f'> **{date_label}｜{entry["status"]}｜{entry["nights"]}泊**'
             )
 
-        lines.append("▼ この月の空室カレンダー")
-        lines.append(group["url"])
-        lines.append("")
+        details = [f'📍 {group["location"]}']
 
-    lines.append("空室状況は変動します。予約前に最新状況をご確認ください。")
+        if group["trip_purpose"]:
+            details.append(f'🎯 {group["trip_purpose"]}')
 
-    return "\n".join(lines)
+        if group["bike_trip"]:
+            details.append(f'🏍 足立発 {group["bike_trip"]}')
 
+        tail = ["", f'🔗 [申し込みする]({group["url"]})', "", *details]
+        current_lines = []
 
-def scan_target(target, today, previous_months, is_baseline):
-    """1施設の3か月分を確認する。施設単位で並行実行する"""
-    target_id = target["id"]
+        for daily_line in daily_lines:
+            if len("\n".join(month_heading + [daily_line] + tail)) > max_block_chars:
+                raise RuntimeError(f"{facility_name} の日付情報とURLが長すぎます")
+
+            candidate = month_heading + current_lines + [daily_line] + tail
+
+            if len("\n".join(candidate)) > max_block_chars:
+                blocks.append({
+                    "text": "\n".join(month_heading + current_lines + tail),
+                    "tags": {tag},
+                    "facility_name": facility_name,
+                })
+                current_lines = []
+
+            current_lines.append(daily_line)
+
+        blocks.append({
+            "text": "\n".join(month_heading + current_lines + tail),
+            "tags": {tag},
+            "facility_name": facility_name,
+        })
+
+    return blocks
+
+def pack_notice_messages(blocks):
+    messages = []
+    current_embeds = []
+    current_tags = set()
+    current_chars = 0
+
+    for block in blocks:
+        title = block["embed_title"]
+        description = block["text"]
+
+        if len(title) > 256:
+            raise RuntimeError(
+                "Embedタイトルが長すぎます"
+            )
+
+        if len(description) > 4096:
+            raise RuntimeError(
+                "Embed本文が長すぎます"
+            )
+
+        embed = {
+            "title": title,
+            "description": description,
+            "color": block["color"],
+        }
+
+        embed_chars = len(title) + len(description)
+
+        needs_new_message = (
+            len(current_embeds) >= MAX_EMBEDS_PER_MESSAGE
+            or current_chars + embed_chars > MAX_EMBED_TOTAL_CHARS
+        )
+
+        if needs_new_message:
+            messages.append({
+                "embeds": current_embeds,
+                "tags": set(current_tags),
+            })
+
+            current_embeds = []
+            current_tags = set()
+            current_chars = 0
+
+        current_embeds.append(embed)
+        current_tags.update(block["tags"])
+        current_chars += embed_chars
+
+    if current_embeds:
+        messages.append({
+            "embeds": current_embeds,
+            "tags": set(current_tags),
+        })
+
+    return messages
+
+RECHECK_INTERVAL = 4
+
+def recheck_month(target_id, year, month, url, days, started, submit_booking, request_slots):
+    label = f"{target_id} {year:04d}-{month:02d}"
+    remaining = set(days)
+    had_error = False
+    for offset in range(RECHECK_INTERVAL, 60, RECHECK_INTERVAL):
+        if not remaining:
+            break
+        deadline = started + offset
+        delay = deadline - time.perf_counter()
+        if delay <= 0:
+            continue
+        time.sleep(delay)
+        # Skip stale slots instead of issuing catch-up requests after a slow response.
+        latest = deadline + RECHECK_INTERVAL
+        wait = latest - time.perf_counter()
+        if wait <= 0 or not request_slots.acquire(timeout=wait):
+            continue
+        try:
+            if time.perf_counter() >= latest:
+                continue
+            with timed_step(f"追加カレンダー GET {label} +{offset}秒"):
+                html = fetch_html(url)
+            with timed_step(f"追加カレンダー解析 {label} +{offset}秒"):
+                current = detect_daily_statuses(html, year, month)
+            for day in sorted(remaining):
+                if current.get(day) in ("○", "△"):
+                    submit_booking(target_id, day)
+                    remaining.remove(day)
+        except Exception as error:
+            print(f"追加確認失敗 {label} +{offset}秒 ({type(error).__name__})", flush=True)
+            had_error = True
+        finally:
+            request_slots.release()
+    return not had_error
+
+def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking, queued_at, schedule_recheck):
+    target_id = str(target["id"])
+    log_duration(f"監視ワーカー待ち {target_id}", queued_at, time.perf_counter())
     name = target["name"]
     location = target["location"]
     nights = target["nights"]
@@ -226,12 +698,7 @@ def scan_target(target, today, previous_months, is_baseline):
     current_months = {}
     newly_available_entries = []
 
-    print("\n" + "=" * 45)
-    print("施設:", name)
-    print("所在地:", location)
-    print("=" * 45)
-
-    for year, month in target_months(today):
+    for year, month in months_to_scan:
         month_key = f"{year:04d}-{month:02d}"
 
         url = make_month_url(
@@ -241,22 +708,22 @@ def scan_target(target, today, previous_months, is_baseline):
             base_date,
         )
 
-        html = fetch_html(url)
-        current = detect_daily_statuses(html, year, month)
+        remaining = [day for day in booking_days if day[:7] == month_key]
+        started = time.perf_counter()
+        try:
+            with timed_step(f"カレンダー GET {target_id} {month_key}"):
+                html = fetch_html(url)
+            with timed_step(f"カレンダー解析 {target_id} {month_key}"):
+                current = detect_daily_statuses(html, year, month)
+            for day in remaining.copy():
+                if current.get(day) in ("○", "△"):
+                    submit_booking(target_id, day)
+                    remaining.remove(day)
+        finally:
+            if remaining:
+                schedule_recheck(target_id, year, month, url, remaining, started)
+
         current_months[month_key] = current
-
-        print(f"\n【{year}年{month}月】")
-        print(f"空室日数: {len(current)}日")
-
-        if current:
-            for day_text, status in sorted(current.items()):
-                print(
-                    f"  {format_japanese_date(day_text)} "
-                    f"{status}"
-                )
-        else:
-            print("  空室はありません")
-
         previous = previous_months.get(month_key, {})
 
         if is_baseline or month_key not in previous_months:
@@ -268,21 +735,18 @@ def scan_target(target, today, previous_months, is_baseline):
             if day not in previous
         }
 
-        if newly_available:
-            print(f"新しく空室になった日: {len(newly_available)}日")
-
         for day, status in newly_available.items():
             newly_available_entries.append({
+                "target_id": target_id,
                 "name": name,
                 "location": location,
                 "day": day,
                 "status": status,
                 "nights": nights,
-                "url": url,
+                "trip_purpose": target.get("trip_purpose", ""),
+                "bike_trip": target.get("bike_trip", ""),
+                "url": target.get("access_url", url),
             })
-
-    if is_baseline:
-        print("\n初回・旧形式からの移行: 通知せず基準を保存します。")
 
     return {
         "target_id": target_id,
@@ -291,126 +755,284 @@ def scan_target(target, today, previous_months, is_baseline):
         "is_baseline": is_baseline,
     }
 
+def fetch_checklist():
+    branch = os.environ.get("BOOKING_BRANCH") or "main"
+    subprocess.run(["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}"],
+                   check=True, timeout=20)
+    snapshot = subprocess.check_output(["git", "show", "FETCH_HEAD:highlight.md"], timeout=5)
+    return snapshot.decode("utf-8-sig").splitlines()
 
-def main():
-    started_at = datetime.now(JST)
-    today = started_at.date()
-    targets = load_targets()
-    state = load_state()
+def main(hourly=False):
+    lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
+    booking_jobs = {}
+    ok = True
+    started = time.monotonic()
+    end = started + 3600
+    next_round = started
+    with ThreadPoolExecutor(max_workers=1) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
+        refresh = None
+        while True:
+            allow_booking = True
+            if refresh is not None:
+                try:
+                    lines = refresh.result()
+                except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+                    print(f"チェックリスト更新失敗。この回の自動申込を休止: {type(error).__name__}", flush=True)
+                    allow_booking = False
+                    ok = False
+            if hourly:
+                if time.monotonic() >= end:
+                    break
+                refresh = settings_executor.submit(fetch_checklist)
+            try:
+                with ExitStack() as background:
+                    if not monitor(booking_executor, background, booking_jobs, lines, allow_booking):
+                        ok = False
+            except (OSError, ValueError, RuntimeError) as error:
+                if not hourly:
+                    raise
+                ok = False
+                print(f"監視エラー: {type(error).__name__}: {error}", flush=True)
+            if not hourly:
+                break
+            next_round = max(next_round + 60, time.monotonic())
+            if next_round >= end:
+                break
+            time.sleep(max(0, next_round - time.monotonic()))
 
-    meta = state.setdefault("_meta", {})
+        with timed_step("残りの申込完了待ち"):
+            for job in booking_jobs.values():
+                if not job.result():
+                    ok = False
+    if not ok:
+        sys.exit(1)
 
-    failures = []
-    normal_notices = []
-    release_notices = []
-    baseline_count = 0
+def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
+    today = datetime.now(JST).date()
 
-    release_key = today.strftime("%Y-%m")
-    is_release_day = today.day == 27
+    with timed_step("施設・注目設定読込"):
+        targets = load_targets()
+        highlighted_ids = load_highlighted_ids(targets, lines)
+    auto_bookings = {}
+    auto_ok = True
 
-    release_already_sent = (
-        meta.get("release_batch_sent") == release_key
+    try:
+        with timed_step("自動申込設定読込"):
+            auto_bookings = load_auto_bookings(targets, lines) if allow_booking else {}
+
+        if auto_bookings and os.environ.get("GITHUB_ACTIONS") != "true":
+            auto_bookings = {}
+            raise RuntimeError("自動申込は GitHub Actions から実行してください")
+    except (ValueError, RuntimeError) as error:
+        print(f"自動申込設定エラー: {error}")
+        auto_ok = False
+
+    print(
+        f"監視対象: {len(targets)}施設、"
+        f"注目施設: {len(highlighted_ids)}施設"
     )
 
-    # 施設ごとに過去状態を読み取り、最大8施設を同時に確認する
+    with timed_step("状態読込"):
+        state = load_state()
+    failures = []
+    successful_results = []
+    baseline_count = 0
+    months_to_scan = target_months(today)
     jobs = {}
+    for key, job in list(booking_jobs.items()):
+        if job.done() and not job.result():
+            auto_ok = False
+            del booking_jobs[key]
+    booking_lock = threading.Lock()
+    submitted = set()
+    recheck_jobs = []
+    request_slots = threading.BoundedSemaphore(MAX_WORKERS)
+
+    def schedule_recheck(target_id, year, month, url, days, started):
+        job = recheck_executor.submit(
+            recheck_month, target_id, year, month, url, days, started, submit_booking, request_slots
+        )
+        with booking_lock:
+            recheck_jobs.append(job)
+
+    def submit_booking(facility_id, day):
+        detected_at = time.perf_counter()
+        with booking_lock:
+            key = (facility_id, day)
+            if key in submitted or key in booking_jobs:
+                return
+            submitted.add(key)
+            print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
+            booking_jobs[key] = booking_executor.submit(run_auto_booking, facility_id, day, detected_at)
+
+    active_days = {
+        facility_id: sorted(day.isoformat() for day in days if day >= today)
+        for facility_id, days in auto_bookings.items()
+    }
+
+    month_keys = {f"{year:04d}-{month:02d}" for year, month in months_to_scan}
+    recheck_count = sum(len({day[:7] for day in days} & month_keys) for days in active_days.values())
+    recheck_executor = background.enter_context(ThreadPoolExecutor(max_workers=max(1, recheck_count)))
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for target in targets:
-            target_id = target["id"]
+        for target in sorted(targets, key=lambda item: not active_days.get(str(item["id"]))):
+            target_id = str(target["id"])
             old_entry = state.get(target_id, {})
-            is_baseline = (
-                not old_entry
-                or "months" not in old_entry
-            )
+            is_baseline = not old_entry or "months" not in old_entry
             previous_months = old_entry.get("months", {})
+
+            booking_days = active_days.get(target_id, ())
+            priority_months = {day[:7] for day in booking_days}
+            ordered_months = sorted(months_to_scan, key=lambda ym: f"{ym[0]:04d}-{ym[1]:02d}" not in priority_months)
 
             future = executor.submit(
                 scan_target,
                 target,
-                today,
+                ordered_months,
                 previous_months,
                 is_baseline,
+                booking_days,
+                submit_booking,
+                time.perf_counter(),
+                schedule_recheck,
             )
+
             jobs[future] = target_id
 
         for future in as_completed(jobs):
             target_id = jobs[future]
+
             try:
                 result = future.result()
-                state[result["target_id"]] = {
-                    "months": result["months"]
-                }
+                successful_results.append(result)
 
                 if result["is_baseline"]:
                     baseline_count += 1
 
-                if is_release_day:
-                    if not release_already_sent:
-                        release_notices.extend(result["entries"])
-                else:
-                    normal_notices.extend(result["entries"])
-
             except Exception as error:
                 failures.append(target_id)
-                print(
-                    f"ERROR target={target_id}: "
-                    f"{type(error).__name__}: {error}"
-                )
+                print(f"ERROR target={target_id}: {type(error).__name__}: {error}")
 
-    # 27日の受付開始通知は全施設分を1通にまとめる
-    if (
-        is_release_day
-        and not release_already_sent
-        and not failures
-    ):
-        if release_notices:
-            message = format_notice(
-                "【ITS健保 受付開始・空室まとめ】",
-                release_notices,
-            )
+    all_notices = []
+    tag_current_data = {}
 
-            line_push(message)
+    with timed_step("差分集計"):
+        for result in successful_results:
+            target_id = result["target_id"]
+            current_months = result["months"]
+            entries = result["entries"]
 
-            print(
-                f"27日まとめ通知成功: "
-                f"{len(release_notices)}件"
-            )
+            old_entry = state.setdefault(target_id, {"months": {}})
+            old_months = old_entry.setdefault("months", {})
 
-            meta["release_batch_sent"] = release_key
+            pending_month_keys = {
+                date.fromisoformat(entry["day"]).strftime("%Y-%m")
+                for entry in entries
+            }
 
-        else:
-            print(
-                "27日まとめ通知: 新しい空室はありません。"
-                "次回の確認でもう一度チェックします。"
-            )
+            for month_key, current_data in current_months.items():
+                if month_key in pending_month_keys:
+                    tag_current_data[(target_id, month_key)] = current_data
+                else:
+                    old_months[month_key] = current_data
 
-    # 通常日は新しく空いた日だけまとめて通知
-    if not is_release_day and normal_notices:
-        message = format_notice(
-            "【ITS健保 新しい空室】",
-            normal_notices,
-        )
+            all_notices.extend(entries)
 
-        line_push(message)
+    with timed_step("状態保存"):
+        save_state(state)
 
-        print(f"通常通知成功: {len(normal_notices)}件")
+    notification_error = None
 
-    save_state(state)
+    if all_notices:
+        try:
+            with timed_step("通知組立"):
+                highlighted_notices = []
+                standard_notices = []
+
+                for entry in all_notices:
+                    if is_highlighted_entry(entry, highlighted_ids):
+                        highlighted_notices.append(entry)
+                    else:
+                        standard_notices.append(entry)
+
+                notice_groups = [
+                    (highlighted_notices, "🚨", COLOR_HIGHLIGHTED),
+                    (standard_notices, "🆕", COLOR_STANDARD),
+                ]
+
+                all_blocks = []
+
+                for notice_group, title, color in notice_groups:
+                    if not notice_group:
+                        continue
+
+                    blocks = build_notice_blocks(notice_group)
+
+                    for block in blocks:
+                        block["embed_title"] = f'{title} {block["facility_name"]}'
+                        block["color"] = color
+
+                    all_blocks.extend(blocks)
+
+                messages = pack_notice_messages(all_blocks)
+
+                tag_message_indexes = {}
+
+                for index, message in enumerate(messages):
+                    for tag in message["tags"]:
+                        tag_message_indexes.setdefault(tag, set()).add(index)
+
+                delivered_indexes = set()
+                committed_tags = set()
+                total_batches = len(messages)
+
+            print("\n通知メッセージ数:", total_batches)
+            print("Embed数:", sum(len(message["embeds"]) for message in messages))
+
+            for index, message in enumerate(messages):
+                print(f"Discord送信: {index + 1}/{total_batches} （1メッセージ）")
+                with timed_step(f"Discord送信 {index + 1}/{total_batches}"):
+                    discord_webhook([message])
+                delivered_indexes.add(index)
+
+                for tag, indexes in tag_message_indexes.items():
+                    if tag in committed_tags:
+                        continue
+
+                    if indexes.issubset(delivered_indexes):
+                        target_id, month_key = tag
+                        state[target_id]["months"][month_key] = tag_current_data[tag]
+                        committed_tags.add(tag)
+
+                with timed_step("通知後の状態保存"):
+                    save_state(state)
+
+            print(f"\n通知送信成功: {len(all_notices)}件")
+
+        except Exception as error:
+            notification_error = error
+            print("\nDiscord通知エラー:", f"{type(error).__name__}: {error}")
+
+    else:
+        print("\n新しい空室はありません。")
 
     if baseline_count:
-        print(
-            f"\n通知なしで基準を作成した施設数: "
-            f"{baseline_count}"
-        )
-
-    elapsed = (datetime.now(JST) - started_at).total_seconds()
-    print(f"\n処理時間: {elapsed:.1f}秒")
-    print(f"同時アクセス上限: {MAX_WORKERS}施設")
+        print(f"\n通知なしで基準を作成した施設数: {baseline_count}")
 
     if failures:
         print("失敗した施設:", ", ".join(failures))
-        sys.exit(1)
 
+    if notification_error:
+        print("通知の一部または全部が未完了です。")
+
+    if recheck_jobs:
+        with timed_step("追加確認の完了待ち"):
+            for job in recheck_jobs:
+                if not job.result():
+                    auto_ok = False
+
+    return not (failures or notification_error or not auto_ok)
 
 if __name__ == "__main__":
-    main()
+    log_duration("初期読込", SCRIPT_START, time.perf_counter())
+    with timed_step("監視全体"):
+        main(hourly="--hourly" in sys.argv[1:])
