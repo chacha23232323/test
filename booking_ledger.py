@@ -153,6 +153,46 @@ def deferred_ledger_enabled():
     return os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("BOOKING_DEFER_LEDGER_WRITE", "").lower() == "true"
 
 
+def snapshot_path():
+    value = os.environ.get("OPERATION_SNAPSHOT")
+    return Path(value) if value and deferred_ledger_enabled() else None
+
+
+def publish_snapshot(path, keys):
+    data = {"run_id": os.environ["GITHUB_RUN_ID"], "keys": sorted(set(keys))}
+    fd, temporary = tempfile.mkstemp(prefix="snapshot-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def snapshot_status(facility_id, stay_date):
+    path = snapshot_path()
+    if path is None:
+        raise RuntimeError("事前取得した状態がありません")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    keys = record.get("keys")
+    if record.get("run_id") != os.environ["GITHUB_RUN_ID"] or not isinstance(keys, list) or any(
+        not isinstance(key, str) or len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key)
+        for key in keys
+    ):
+        raise RuntimeError("事前取得した状態を確認できません")
+    key = booking_key(facility_id, stay_date)
+    if key in keys or (path.parent / ("seen-" + key)).exists():
+        return "recorded"
+    return None
+
+
+def remember_snapshot_record(facility_id, stay_date):
+    path = snapshot_path()
+    if path is not None:
+        (path.parent / ("seen-" + booking_key(facility_id, stay_date))).touch()
+
+
 def booking_operation_lock(facility_id, stay_date):
     return local_slots("booking-" + booking_key(facility_id, stay_date), timeout=270)
 
@@ -197,6 +237,7 @@ def recover_local_attempt(facility_id, stay_date, ledger=None):
         ledger.write(status)
     elif previous.get("run_id") != record["run_id"] or previous.get("status") != status:
         raise RuntimeError("ローカルとGitHubの申込記録が一致しません。手動確認してください")
+    remember_snapshot_record(facility_id, stay_date)
     clear_local_attempt(facility_id, stay_date)
     print(f"::warning::{facility_id} {stay_date}: 申込履歴を復旧しました ({status})。メールと申込状況を確認してください。", flush=True)
     return True
