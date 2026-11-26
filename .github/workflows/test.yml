@@ -1,4 +1,3 @@
-
 name: test
 
 on:
@@ -44,6 +43,7 @@ jobs:
       - name: Run configured checks
         id: watch
         env:
+          BOOKING_DEFER_LEDGER_WRITE: "true"
           BOOKING_ORIGIN: ${{ secrets.BOOKING_ORIGIN }}
           BOOKING_BRANCH: main
           BOOKING_GITHUB_TOKEN: ${{ github.token }}
