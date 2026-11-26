@@ -1,6 +1,7 @@
 """Read the matching message and complete the application."""
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,10 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
+from booking_ledger import (
+    MAX_BROWSER_WORKERS, local_slots, lock_root, check_booking_access,
+    check_site_status, pause_booking,
+)
 
 SUBJECT_SUFFIX = "申込手続きのご案内"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -104,6 +109,7 @@ def message_links(raw, facility):
 
 
 def site_page(response, expected_path):
+    check_site_status(response.status_code, response.headers.get("Retry-After"))
     parsed = urlsplit(response.url)
     host = urlsplit(booking_origin()).netloc
     if response.status_code != 200 or (
@@ -128,6 +134,7 @@ def site_page(response, expected_path):
         'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
         'iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, .cf-turnstile'
     ) or "人間であることを確認" in page.get_text(" ", strip=True):
+        pause_booking()
         raise RuntimeError("本人確認画面が表示されました。案内メールから手動で進めてください")
     return page
 
@@ -214,6 +221,15 @@ def matching_summary(page, stay_date, facility):
     return not summary_mismatches(page, stay_date, facility)
 
 
+def claim_path(link):
+    return lock_root() / ("mail-" + hashlib.sha256(link.encode()).hexdigest() + ".claim")
+
+
+def other_date_claimed(link, stay_date):
+    path = claim_path(link)
+    return path.exists() and path.read_text(encoding="utf-8") != stay_date
+
+
 def find_application(session, headers, since_ms, stay_date, facility):
     # Allow for clock differences and Gmail timestamps rounded to seconds.
     first_second = since_ms // 1000 - 60
@@ -224,10 +240,11 @@ def find_application(session, headers, since_ms, stay_date, facility):
     link_count = 0
     link_mismatches = set()
     while True:
+        check_booking_access()
         listing = json_response(requests.get(
             f"{GMAIL}/messages",
-            params={"q": f'after:{first_second - 1}',
-                    "maxResults": 15},
+            params={"q": f'after:{first_second - 1} from:{mail_sender()}',
+                    "maxResults": 50},
             headers=headers, timeout=TIMEOUT, allow_redirects=False,
         ))
         if listing.get("nextPageToken"):
@@ -252,6 +269,8 @@ def find_application(session, headers, since_ms, stay_date, facility):
             links = message_links(message["raw"], facility)
             link_count += len(links)
             for link in links:
+                if other_date_claimed(link, stay_date):
+                    continue
                 if time.monotonic() >= deadline:
                     raise RuntimeError("申込リンクの照合時間を超えました")
                 response = session.get(link, timeout=TIMEOUT, allow_redirects=False)
@@ -269,6 +288,7 @@ def find_application(session, headers, since_ms, stay_date, facility):
                 page = site_page(response, "/apply/new")
                 if not matching_summary(page, stay_date, facility):
                     raise RuntimeError("再表示した入力画面の宿泊条件が一致しません")
+            claim_path(link).write_text(stay_date, encoding="utf-8")
             return response, page, parse_qs(urlsplit(link).query)["c"][0]
         if len(matches) > 1:
             raise RuntimeError("同じ宿泊日の申込リンクが複数あります")
@@ -296,6 +316,7 @@ class BrowserReader:
         self.page = page
 
     def get(self, url, *, timeout, allow_redirects):
+        check_booking_access()
         response = self.page.goto(url, wait_until="domcontentloaded", timeout=10_000)
         return browser_response(self.page, response)
 
@@ -344,6 +365,7 @@ def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, bef
             locator.fill(value)
 
     button = form_button(page, form, "申込する")
+    check_booking_access()
     with page.expect_navigation(wait_until="domcontentloaded") as navigated:
         button.click()
     confirmed = browser_response(page, navigated.value)
@@ -359,7 +381,9 @@ def submit_in_browser(page, headers, profile, since_ms, stay_date, facility, bef
         raise RuntimeError("最終送信用の申込情報が一致しません")
     button = form_button(page, form, "確認")
 
+    check_booking_access()
     before_final()
+    check_booking_access()
     with page.expect_navigation(wait_until="domcontentloaded") as navigated:
         button.click()
     complete = browser_response(page, navigated.value)
@@ -376,26 +400,31 @@ def launch_booking_browser(playwright):
         return playwright.chromium.launch(executable_path=chrome)
 
     chromium = Path(playwright.chromium.executable_path)
-    if not chromium.is_file():
-        print("案内メール送信後にChromiumを準備します", flush=True)
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True, timeout=90,
-            )
-        except (OSError, subprocess.SubprocessError):
-            raise RuntimeError("Chromiumを準備できませんでした。届いた案内メールを確認してください") from None
+    with local_slots("chromium-install", timeout=100):
+        if not chromium.is_file():
+            print("案内メール送信後にChromiumを準備します", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True, timeout=90,
+                )
+            except (OSError, subprocess.SubprocessError):
+                raise RuntimeError("Chromiumを準備できませんでした。届いた案内メールを確認してください") from None
     return playwright.chromium.launch(executable_path=str(chromium))
 
 
 def final_submission(headers, profile, since_ms, stay_date, facility, before_final):
     from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as playwright:
-        browser = launch_booking_browser(playwright)
-        try:
-            page = browser.new_page(locale="ja-JP")
-            page.set_default_timeout(12_000)
-            submit_in_browser(page, headers, profile, since_ms, stay_date, facility, before_final)
-        finally:
-            browser.close()
+    facility_key = hashlib.sha256(compact(facility).encode()).hexdigest()[:24]
+    with local_slots("mail-facility-" + facility_key, timeout=100):
+        with local_slots("browser", count=MAX_BROWSER_WORKERS, timeout=100):
+            check_booking_access()
+            with sync_playwright() as playwright:
+                browser = launch_booking_browser(playwright)
+                try:
+                    page = browser.new_page(locale="ja-JP")
+                    page.set_default_timeout(12_000)
+                    submit_in_browser(page, headers, profile, since_ms, stay_date, facility, before_final)
+                finally:
+                    browser.close()
