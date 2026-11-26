@@ -145,9 +145,66 @@ def local_slots(name, count=1, timeout=45):
         time.sleep(0.15)
 
 
+def booking_key(facility_id, stay_date):
+    return hashlib.sha256(f"{facility_id}\n{stay_date}".encode()).hexdigest()
+
+
+def deferred_ledger_enabled():
+    return os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("BOOKING_DEFER_LEDGER_WRITE", "").lower() == "true"
+
+
+def booking_operation_lock(facility_id, stay_date):
+    return local_slots("booking-" + booking_key(facility_id, stay_date), timeout=270)
+
+
+def local_attempt_path(facility_id, stay_date):
+    return lock_root() / ("attempt-" + booking_key(facility_id, stay_date) + ".json")
+
+
+def mark_local_attempt(facility_id, stay_date, status):
+    if status not in ("pending", "email_sent"):
+        raise RuntimeError("ローカル申込状態が不正です")
+    path = local_attempt_path(facility_id, stay_date)
+    record = {"run_id": os.environ["GITHUB_RUN_ID"], "status": status}
+    fd, temporary = tempfile.mkstemp(prefix="attempt-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clear_local_attempt(facility_id, stay_date):
+    local_attempt_path(facility_id, stay_date).unlink(missing_ok=True)
+
+
+def recover_local_attempt(facility_id, stay_date, ledger=None):
+    """Caller holds the per-booking local lock. Never resubmit to the facility."""
+    path = local_attempt_path(facility_id, stay_date)
+    if not path.exists():
+        return False
+    record = json.loads(path.read_text(encoding="utf-8"))
+    status = record.get("status")
+    if record.get("run_id") != os.environ["GITHUB_RUN_ID"] or status not in ("pending", "email_sent"):
+        raise RuntimeError("ローカル申込記録の所有者または状態を確認できません")
+    ledger = ledger if ledger is not None else BookingLedger(facility_id, stay_date)
+    previous, _ = ledger._read()
+    if previous is None:
+        ledger.write(status)
+    elif previous.get("run_id") != record["run_id"] or previous.get("status") != status:
+        raise RuntimeError("ローカルとGitHubの申込記録が一致しません。手動確認してください")
+    clear_local_attempt(facility_id, stay_date)
+    print(f"::warning::{facility_id} {stay_date}: 申込履歴を復旧しました ({status})。メールと申込状況を確認してください。", flush=True)
+    return True
+
+
 class BookingLedger:
     def __init__(self, facility_id, stay_date):
-        key = hashlib.sha256(f"{facility_id}\n{stay_date}".encode()).hexdigest()
+        key = booking_key(facility_id, stay_date)
         self.branch = os.environ["BOOKING_BRANCH"]
         repo = os.environ["GITHUB_REPOSITORY"]
         self.url = f"{os.environ['GITHUB_API_URL']}/repos/{repo}/contents/.booking-ledger/{key}.json"
@@ -185,7 +242,7 @@ class BookingLedger:
 
     def write(self, status, sha=None):
         expected_previous = {"email_sent": "pending", "finalizing": "email_sent", "accepted": "finalizing"}
-        if (sha is None and status != "pending") or (sha is not None and status not in expected_previous):
+        if (sha is None and status not in ("pending", "email_sent")) or (sha is not None and status not in expected_previous):
             raise RuntimeError("申込記録の状態遷移が正しくありません")
         record = dict(self.record, status=status)
         payload = {
