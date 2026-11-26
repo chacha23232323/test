@@ -20,6 +20,8 @@ from bs4 import BeautifulSoup
 from booking_ledger import (
     BookingLedger, BookingAccessPaused, BookingAccessDenied, BOOKING_FAILED, BOOKING_RETRY,
     BOOKING_PAUSED, BOOKING_DEFERRED, check_booking_access, check_site_status,
+    deferred_ledger_enabled, booking_operation_lock, local_attempt_path, mark_local_attempt,
+    clear_local_attempt, recover_local_attempt,
 )
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
@@ -221,10 +223,21 @@ def main():
         if not re.fullmatch(r"[^\s@]+@[^\s@]+", args.email):
             fail("BOOKING_EMAILに有効なメールアドレスを設定してください")
 
+    if deferred_ledger_enabled():
+        with booking_operation_lock(args.facility_id, args.date):
+            return run_booking(args)
+    return run_booking(args)
+
+
+def run_booking(args):
+    fast = deferred_ledger_enabled()
     ledger = None
     if os.environ.get("GITHUB_ACTIONS") == "true":
         with timed_step('申込履歴確認'):
             ledger = BookingLedger(args.facility_id, args.date)
+            if fast and local_attempt_path(args.facility_id, args.date).exists():
+                recover_local_attempt(args.facility_id, args.date, ledger)
+                return
             status = ledger.existing_status()
         if status == "pending":
             print(f"::warning::{args.facility_id} {args.date}: 前回の結果が未確定です。確認メールと申込状況を確認してください。")
@@ -384,15 +397,31 @@ def main():
         form_data[session_guid["name"]] = session_guid.get("value", "")
 
         create_url = booking_url(response.url, form.get("action", ""))
-    with timed_step('申込前の履歴記録'):
-        check_booking_access()
-        sha = ledger.write("pending") if ledger else None
+    check_booking_access()
+    sha = None
+    if fast:
+        with timed_step('申込前のローカル安全記録'):
+            mark_local_attempt(args.facility_id, args.date, "pending")
+    else:
+        with timed_step('申込前の履歴記録'):
+            sha = ledger.write("pending") if ledger else None
     try:
         since_ms = request_confirmation_email(session, create_url, form_data, args.email)
         if ledger:
             with timed_step('メール送信済み記録'):
-                sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
+                if fast:
+                    mark_local_attempt(args.facility_id, args.date, "email_sent")
+                    sha = ledger.write("email_sent")
+                    clear_local_attempt(args.facility_id, args.date)
+                else:
+                    sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
     except Exception as error:
+        if fast:
+            try:
+                with timed_step('異常時の申込履歴復旧'):
+                    recover_local_attempt(args.facility_id, args.date, ledger)
+            except Exception as recovery_error:
+                print(f"::warning::{args.facility_id} {args.date}: GitHub履歴復旧失敗 ({type(recovery_error).__name__})。再申込せずメールと申込状況を確認してください。", flush=True)
         raise RuntimeError(
             f"部屋選択以降の結果を確定できません。詳細: {booking_failure_detail(error)}。"
             "再実行する前に確認メールと申込状況を確認してください。"
