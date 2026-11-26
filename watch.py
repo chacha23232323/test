@@ -9,6 +9,7 @@ import sys
 import subprocess
 import calendar
 import threading
+import tempfile
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from datetime import date, datetime
@@ -19,12 +20,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 from lxml import html as lxml_html
+from booking_ledger import (
+    BOOKING_OK, BOOKING_FAILED, BOOKING_RETRY, BOOKING_PAUSED,
+    booking_paused, check_booking_access, check_site_status,
+)
 
 STATE_PATH = Path("state.json")
 AUTO_BOOKING_SECTION = "## 自動申込チェックリスト"
 JST = ZoneInfo("Asia/Tokyo")
 
 MAX_WORKERS = 17
+MAX_BOOKING_WORKERS = 10
+MAX_BOOKING_ATTEMPTS = 3
 REQUEST_TIMEOUT = (5, 25)
 
 MAX_EMBEDS_PER_MESSAGE = 10
@@ -51,12 +58,14 @@ WEEKDAY_MAP = {
 
 WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
+
 def log_duration(label, start, end, result="完了"):
     print(
         f"[監視計測] {label} | {result} | 所要 {(end - start) * 1000:.1f} ms"
         f" | 監視開始から {(start - SCRIPT_START) * 1000:.1f} → {(end - SCRIPT_START) * 1000:.1f} ms",
         flush=True,
     )
+
 
 @contextmanager
 def timed_step(label):
@@ -68,6 +77,7 @@ def timed_step(label):
         raise
     else:
         log_duration(label, start, time.perf_counter())
+
 
 def get_session():
     if not hasattr(_thread_local, "session"):
@@ -88,6 +98,7 @@ def get_session():
         _thread_local.session = session
 
     return _thread_local.session
+
 
 def get_discord_session():
     global _discord_session
@@ -110,6 +121,7 @@ def get_discord_session():
 
     return _discord_session
 
+
 def load_targets():
     data = json.loads(
         Path("targets.json").read_text(encoding="utf-8")
@@ -129,6 +141,7 @@ def load_targets():
             raise RuntimeError("施設IDが未設定です")
 
     return targets
+
 
 def parse_highlight_weekdays(label, line_number):
     day_match = re.search(
@@ -167,6 +180,7 @@ def parse_highlight_weekdays(label, line_number):
         weekdays.add(WEEKDAY_MAP[character])
 
     return weekdays
+
 
 def load_highlighted_ids(targets, lines):
     target_ids = [str(target["id"]) for target in targets]
@@ -225,6 +239,7 @@ def load_highlighted_ids(targets, lines):
 
     return highlighted_ids
 
+
 def load_auto_bookings(targets, lines):
     valid_ids = {str(target["id"]) for target in targets}
     sections = [
@@ -273,7 +288,10 @@ def load_auto_bookings(targets, lines):
 
     return bookings
 
+
 def run_auto_booking(facility_id, day, detected_at):
+    if booking_paused():
+        return BOOKING_PAUSED
     key = f"{facility_id} {day}"
     log_duration("申込ワーカー待ち " + key, detected_at, time.perf_counter())
     print(f"自動申込確認: {facility_id} {day}", flush=True)
@@ -297,13 +315,22 @@ def run_auto_booking(facility_id, day, detected_at):
                 check=True,
                 timeout=270,
             )
+    except subprocess.CalledProcessError as error:
+        if error.returncode == BOOKING_RETRY:
+            print(f"自動申込の再確認対象: {key}", flush=True)
+            return BOOKING_RETRY
+        if error.returncode == BOOKING_PAUSED:
+            return BOOKING_PAUSED
+        print(f"自動申込を確認できませんでした: {key} (終了コード {error.returncode})", flush=True)
+        return BOOKING_FAILED
     except (subprocess.SubprocessError, OSError) as error:
         print(
             f"自動申込を確認できませんでした: "
             f"{facility_id} {day} ({type(error).__name__})"
         )
-        return False
-    return True
+        return BOOKING_FAILED
+    return BOOKING_OK
+
 
 def is_highlighted_entry(entry, highlighted_ids):
     target_id = str(entry["target_id"])
@@ -322,6 +349,7 @@ def is_highlighted_entry(entry, highlighted_ids):
 
     return entry_weekday in weekdays
 
+
 def make_month_url(original_url, year, month, base_date):
     last_day = calendar.monthrange(year, month)[1]
     day = min(base_date.day, last_day)
@@ -339,6 +367,7 @@ def make_month_url(original_url, year, month, base_date):
         parts.fragment,
     ))
 
+
 def target_months(today):
     result = []
 
@@ -350,14 +379,18 @@ def target_months(today):
 
     return result
 
+
 def fetch_html(url):
+    check_booking_access()
     with get_session().get(
         url,
         timeout=REQUEST_TIMEOUT,
     ) as response:
+        check_site_status(response.status_code, response.headers.get("Retry-After"))
         response.raise_for_status()
         response.encoding = "utf-8"
         return response.text
+
 
 def detect_daily_statuses(html, year, month):
     if not html or not html.strip():
@@ -400,6 +433,7 @@ def detect_daily_statuses(html, year, month):
 
     return results
 
+
 def load_state():
     if not STATE_PATH.exists():
         return {}
@@ -413,6 +447,7 @@ def load_state():
             "state.json が壊れています。安全のため停止します"
         ) from None
 
+
 def save_state(state):
     temp_path = STATE_PATH.with_suffix(".tmp")
 
@@ -422,6 +457,7 @@ def save_state(state):
     )
 
     os.replace(temp_path, STATE_PATH)
+
 
 def discord_webhook(messages):
     webhook_url = os.environ.get(
@@ -509,6 +545,7 @@ def discord_webhook(messages):
                     f"({type(error).__name__}: {error})"
                 ) from error
 
+
 def format_japanese_date(day_text):
     day = date.fromisoformat(day_text)
 
@@ -516,6 +553,7 @@ def format_japanese_date(day_text):
         f"{day.year}年{day.month}月{day.day}日"
         f"（{WEEKDAYS_JA[day.weekday()]}）"
     )
+
 
 def build_notice_blocks(entries, max_block_chars=3800):
     grouped = {}
@@ -595,6 +633,7 @@ def build_notice_blocks(entries, max_block_chars=3800):
 
     return blocks
 
+
 def pack_notice_messages(blocks):
     messages = []
     current_embeds = []
@@ -650,13 +689,50 @@ def pack_notice_messages(blocks):
 
     return messages
 
+
 RECHECK_INTERVAL = 4
 
-def recheck_month(target_id, year, month, url, days, started, submit_booking, request_slots):
+
+class BookingRound:
+    def __init__(self, executor, jobs):
+        self.executor = executor
+        self.jobs = jobs
+        self.attempts = {}
+        self.lock = threading.Lock()
+
+    def _state(self, key):
+        if booking_paused() or self.attempts.get(key, 0) >= MAX_BOOKING_ATTEMPTS:
+            return "stop"
+        job = self.jobs.get(key)
+        if job is None:
+            return "ready"
+        if not job.done():
+            return "wait"
+        return "ready" if job.result() == BOOKING_RETRY else "stop"
+
+    def state(self, facility_id, day):
+        with self.lock:
+            return self._state((facility_id, day))
+
+    def submit(self, facility_id, day):
+        detected_at = time.perf_counter()
+        key = (facility_id, day)
+        with self.lock:
+            if self._state(key) != "ready":
+                return False
+            attempt = self.attempts.get(key, 0) + 1
+            self.attempts[key] = attempt
+            print(f"自動申込対象の空室を検知: {facility_id} {day} (試行 {attempt}/{MAX_BOOKING_ATTEMPTS})", flush=True)
+            self.jobs[key] = self.executor.submit(run_auto_booking, facility_id, day, detected_at)
+            return True
+
+
+def recheck_month(target_id, year, month, url, days, started, booking_round, request_slots):
     label = f"{target_id} {year:04d}-{month:02d}"
     remaining = set(days)
     had_error = False
     for offset in range(RECHECK_INTERVAL, 60, RECHECK_INTERVAL):
+        remaining = {day for day in remaining if booking_round.state(target_id, day) != "stop"}
         if not remaining:
             break
         deadline = started + offset
@@ -664,6 +740,9 @@ def recheck_month(target_id, year, month, url, days, started, submit_booking, re
         if delay <= 0:
             continue
         time.sleep(delay)
+        ready = [day for day in remaining if booking_round.state(target_id, day) == "ready"]
+        if not ready:
+            continue
         # Skip stale slots instead of issuing catch-up requests after a slow response.
         latest = deadline + RECHECK_INTERVAL
         wait = latest - time.perf_counter()
@@ -676,10 +755,9 @@ def recheck_month(target_id, year, month, url, days, started, submit_booking, re
                 html = fetch_html(url)
             with timed_step(f"追加カレンダー解析 {label} +{offset}秒"):
                 current = detect_daily_statuses(html, year, month)
-            for day in sorted(remaining):
+            for day in sorted(ready):
                 if current.get(day) in ("○", "△"):
-                    submit_booking(target_id, day)
-                    remaining.remove(day)
+                    booking_round.submit(target_id, day)
         except Exception as error:
             print(f"追加確認失敗 {label} +{offset}秒 ({type(error).__name__})", flush=True)
             had_error = True
@@ -687,7 +765,8 @@ def recheck_month(target_id, year, month, url, days, started, submit_booking, re
             request_slots.release()
     return not had_error
 
-def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, submit_booking, queued_at, schedule_recheck):
+
+def scan_target(target, months_to_scan, previous_months, is_baseline, booking_days, booking_round, queued_at, schedule_recheck):
     target_id = str(target["id"])
     log_duration(f"監視ワーカー待ち {target_id}", queued_at, time.perf_counter())
     name = target["name"]
@@ -717,9 +796,9 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
                 current = detect_daily_statuses(html, year, month)
             for day in remaining.copy():
                 if current.get(day) in ("○", "△"):
-                    submit_booking(target_id, day)
-                    remaining.remove(day)
+                    booking_round.submit(target_id, day)
         finally:
+            remaining = [day for day in remaining if booking_round.state(target_id, day) != "stop"]
             if remaining:
                 schedule_recheck(target_id, year, month, url, remaining, started)
 
@@ -755,6 +834,7 @@ def scan_target(target, months_to_scan, previous_months, is_baseline, booking_da
         "is_baseline": is_baseline,
     }
 
+
 def fetch_checklist():
     branch = os.environ.get("BOOKING_BRANCH") or "main"
     subprocess.run(["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}"],
@@ -762,16 +842,33 @@ def fetch_checklist():
     snapshot = subprocess.check_output(["git", "show", "FETCH_HEAD:highlight.md"], timeout=5)
     return snapshot.decode("utf-8-sig").splitlines()
 
+
 def main(hourly=False):
+    with tempfile.TemporaryDirectory(prefix="its-booking-run-") as directory:
+        previous = os.environ.get("BOOKING_PAUSE_FILE")
+        os.environ["BOOKING_PAUSE_FILE"] = str(Path(directory) / "paused")
+        try:
+            run_monitor(hourly)
+        finally:
+            if previous is None:
+                os.environ.pop("BOOKING_PAUSE_FILE", None)
+            else:
+                os.environ["BOOKING_PAUSE_FILE"] = previous
+
+
+def run_monitor(hourly=False):
     lines = Path("highlight.md").read_text(encoding="utf-8-sig").splitlines()
     booking_jobs = {}
     ok = True
     started = time.monotonic()
     end = started + 3600
     next_round = started
-    with ThreadPoolExecutor(max_workers=1) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
+    with ThreadPoolExecutor(max_workers=MAX_BOOKING_WORKERS) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
         refresh = None
         while True:
+            if booking_paused():
+                ok = False
+                break
             allow_booking = True
             if refresh is not None:
                 try:
@@ -793,6 +890,9 @@ def main(hourly=False):
                     raise
                 ok = False
                 print(f"監視エラー: {type(error).__name__}: {error}", flush=True)
+            if booking_paused():
+                ok = False
+                break
             if not hourly:
                 break
             next_round = max(next_round + 60, time.monotonic())
@@ -802,10 +902,11 @@ def main(hourly=False):
 
         with timed_step("残りの申込完了待ち"):
             for job in booking_jobs.values():
-                if not job.result():
+                if job.result() != BOOKING_OK:
                     ok = False
     if not ok:
         sys.exit(1)
+
 
 def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
     today = datetime.now(JST).date()
@@ -840,30 +941,20 @@ def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
     months_to_scan = target_months(today)
     jobs = {}
     for key, job in list(booking_jobs.items()):
-        if job.done() and not job.result():
+        if job.done() and job.result() == BOOKING_RETRY:
             auto_ok = False
             del booking_jobs[key]
     booking_lock = threading.Lock()
-    submitted = set()
+    booking_round = BookingRound(booking_executor, booking_jobs)
     recheck_jobs = []
     request_slots = threading.BoundedSemaphore(MAX_WORKERS)
 
     def schedule_recheck(target_id, year, month, url, days, started):
         job = recheck_executor.submit(
-            recheck_month, target_id, year, month, url, days, started, submit_booking, request_slots
+            recheck_month, target_id, year, month, url, days, started, booking_round, request_slots
         )
         with booking_lock:
             recheck_jobs.append(job)
-
-    def submit_booking(facility_id, day):
-        detected_at = time.perf_counter()
-        with booking_lock:
-            key = (facility_id, day)
-            if key in submitted or key in booking_jobs:
-                return
-            submitted.add(key)
-            print(f"自動申込対象の空室を検知: {facility_id} {day}", flush=True)
-            booking_jobs[key] = booking_executor.submit(run_auto_booking, facility_id, day, detected_at)
 
     active_days = {
         facility_id: sorted(day.isoformat() for day in days if day >= today)
@@ -891,7 +982,7 @@ def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
                 previous_months,
                 is_baseline,
                 booking_days,
-                submit_booking,
+                booking_round,
                 time.perf_counter(),
                 schedule_recheck,
             )
@@ -1031,6 +1122,7 @@ def monitor(booking_executor, background, booking_jobs, lines, allow_booking):
                     auto_ok = False
 
     return not (failures or notification_error or not auto_ok)
+
 
 if __name__ == "__main__":
     log_duration("初期読込", SCRIPT_START, time.perf_counter())
