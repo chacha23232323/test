@@ -21,7 +21,7 @@ from booking_ledger import (
     BookingLedger, BookingAccessPaused, BookingAccessDenied, BOOKING_FAILED, BOOKING_RETRY,
     BOOKING_PAUSED, BOOKING_DEFERRED, check_booking_access, check_site_status,
     deferred_ledger_enabled, booking_operation_lock, local_attempt_path, mark_local_attempt,
-    clear_local_attempt, recover_local_attempt,
+    clear_local_attempt, recover_local_attempt, snapshot_path, snapshot_status, remember_snapshot_record,
 )
 from finish_booking import booking_origin, config_from_env, final_submission, gmail_headers
 
@@ -238,7 +238,13 @@ def run_booking(args):
             if fast and local_attempt_path(args.facility_id, args.date).exists():
                 recover_local_attempt(args.facility_id, args.date, ledger)
                 return
-            status = ledger.existing_status()
+            if fast and snapshot_path() is not None:
+                status = snapshot_status(args.facility_id, args.date)
+            else:
+                status = ledger.existing_status()
+        if status == "recorded":
+            print(f"{args.facility_id} {args.date}: 既存の処理記録があるためスキップします。")
+            return
         if status == "pending":
             print(f"::warning::{args.facility_id} {args.date}: 前回の結果が未確定です。確認メールと申込状況を確認してください。")
             return
@@ -412,6 +418,7 @@ def run_booking(args):
                 if fast:
                     mark_local_attempt(args.facility_id, args.date, "email_sent")
                     sha = ledger.write("email_sent")
+                    remember_snapshot_record(args.facility_id, args.date)
                     clear_local_attempt(args.facility_id, args.date)
                 else:
                     sha = booking_step("メール送信完了記録", ledger.write, "email_sent", sha)
