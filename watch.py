@@ -23,6 +23,7 @@ from lxml import html as lxml_html
 from booking_ledger import (
     BOOKING_OK, BOOKING_FAILED, BOOKING_RETRY, BOOKING_PAUSED, BOOKING_DEFERRED,
     BookingAccessDenied, BookingAccessPaused, cooldown_remaining,
+    deferred_ledger_enabled, booking_operation_lock, recover_local_attempt, local_attempt_path,
     booking_paused, check_booking_access, check_site_status,
 )
 
@@ -292,6 +293,20 @@ def load_auto_bookings(targets, lines):
     return bookings
 
 
+def recover_failed_child(facility_id, day):
+    if not deferred_ledger_enabled():
+        return False
+    try:
+        if local_attempt_path(facility_id, day).exists():
+            with booking_operation_lock(facility_id, day):
+                recover_local_attempt(facility_id, day)
+            return True
+        return False
+    except Exception as error:
+        print(f"::warning::{facility_id} {day}: 子プロセス終了後の履歴復旧失敗 ({type(error).__name__})。再申込せず手動確認してください。", flush=True)
+        return True
+
+
 def run_auto_booking(facility_id, day, detected_at):
     if booking_paused():
         return BOOKING_DEFERRED
@@ -319,6 +334,8 @@ def run_auto_booking(facility_id, day, detected_at):
                 timeout=270,
             )
     except subprocess.CalledProcessError as error:
+        if recover_failed_child(facility_id, day):
+            return BOOKING_FAILED
         if error.returncode == BOOKING_RETRY:
             print(f"自動申込の再確認対象: {key}", flush=True)
             return BOOKING_RETRY
@@ -327,6 +344,7 @@ def run_auto_booking(facility_id, day, detected_at):
         print(f"自動申込を確認できませんでした: {key} (終了コード {error.returncode})", flush=True)
         return BOOKING_FAILED
     except (subprocess.SubprocessError, OSError) as error:
+        recover_failed_child(facility_id, day)
         print(
             f"自動申込を確認できませんでした: "
             f"{facility_id} {day} ({type(error).__name__})"
