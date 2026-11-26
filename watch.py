@@ -24,7 +24,7 @@ from booking_ledger import (
     BOOKING_OK, BOOKING_FAILED, BOOKING_RETRY, BOOKING_PAUSED, BOOKING_DEFERRED,
     BookingAccessDenied, BookingAccessPaused, cooldown_remaining,
     deferred_ledger_enabled, booking_operation_lock, recover_local_attempt, local_attempt_path,
-    booking_paused, check_booking_access, check_site_status,
+    booking_paused, check_booking_access, check_site_status, snapshot_path, publish_snapshot,
 )
 
 STATE_PATH = Path("state.json")
@@ -875,23 +875,49 @@ def fetch_checklist():
     branch = os.environ.get("BOOKING_BRANCH") or "main"
     subprocess.run(["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}"],
                    check=True, timeout=20)
-    snapshot = subprocess.check_output(["git", "show", "FETCH_HEAD:highlight.md"], timeout=5)
-    return snapshot.decode("utf-8-sig").splitlines()
+    revision = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], timeout=5).decode("ascii").strip()
+    snapshot = subprocess.check_output(["git", "show", f"{revision}:highlight.md"], timeout=5)
+    lines = snapshot.decode("utf-8-sig").splitlines()
+    if snapshot_path() is None:
+        return lines
+    tree = subprocess.check_output(["git", "ls-tree", "-r", "--name-only", "-z", revision, "--", ".booking-ledger/"], timeout=10)
+    keys = []
+    for entry in tree.decode("utf-8").split("\0"):
+        match = re.fullmatch(r"\.booking-ledger/([0-9a-f]{64})\.json", entry)
+        if match:
+            keys.append(match.group(1))
+    return lines, keys
+
+
+def install_configuration(configuration):
+    path = snapshot_path()
+    if path is None:
+        return configuration
+    lines, keys = configuration
+    publish_snapshot(path, keys)
+    print(f"状態事前取得: {len(keys)}件", flush=True)
+    return lines
 
 
 def main(hourly=False):
     with _denied_urls_lock:
         _denied_urls.clear()
-    with tempfile.TemporaryDirectory(prefix="its-booking-run-") as directory:
-        previous = os.environ.get("BOOKING_PAUSE_FILE")
+    with tempfile.TemporaryDirectory(prefix="operation-run-") as directory:
+        names = ("BOOKING_PAUSE_FILE", "OPERATION_SNAPSHOT")
+        previous = {name: os.environ.get(name) for name in names}
         os.environ["BOOKING_PAUSE_FILE"] = str(Path(directory) / "paused")
+        if deferred_ledger_enabled():
+            os.environ["OPERATION_SNAPSHOT"] = str(Path(directory) / "snapshot.json")
+        else:
+            os.environ.pop("OPERATION_SNAPSHOT", None)
         try:
             run_monitor(hourly)
         finally:
-            if previous is None:
-                os.environ.pop("BOOKING_PAUSE_FILE", None)
-            else:
-                os.environ["BOOKING_PAUSE_FILE"] = previous
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def run_monitor(hourly=False):
@@ -903,6 +929,15 @@ def run_monitor(hourly=False):
     next_round = started
     with ThreadPoolExecutor(max_workers=MAX_BOOKING_WORKERS) as booking_executor, ThreadPoolExecutor(max_workers=1) as settings_executor:
         refresh = None
+        initial_ready = True
+        if snapshot_path() is not None:
+            try:
+                with timed_step("初回状態事前取得"):
+                    lines = install_configuration(fetch_checklist())
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+                print(f"状態事前取得失敗。この回の自動申込を休止: {type(error).__name__}", flush=True)
+                initial_ready = False
+                ok = False
         while True:
             if hourly and time.monotonic() >= end:
                 break
@@ -919,13 +954,14 @@ def run_monitor(hourly=False):
                     print("施設アクセス休止解除: 監視を再開します", flush=True)
                     next_round = time.monotonic()
                 continue
-            allow_booking = True
+            allow_booking = initial_ready
             if refresh is not None:
                 try:
-                    lines = refresh.result()
-                except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+                    lines = install_configuration(refresh.result())
+                    allow_booking = initial_ready = True
+                except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
                     print(f"チェックリスト更新失敗。この回の自動申込を休止: {type(error).__name__}", flush=True)
-                    allow_booking = False
+                    allow_booking = initial_ready = False
                     ok = False
             if hourly:
                 if time.monotonic() >= end:
