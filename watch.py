@@ -518,7 +518,7 @@ def discord_webhook(messages):
                 with session.post(
                     webhook_url,
                     json=payload,
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=(5, 40),
                 ) as response:
 
                     if response.status_code == 429:
